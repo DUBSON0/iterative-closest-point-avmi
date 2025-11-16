@@ -19,6 +19,8 @@ rad.json
 #License-file
 *.flf
 #Test results file
+data/
+venv/
 TestResults.xmlseperate_point_cloud_viewer/pointcloud-1-line.csv
 seperate_point_cloud_viewer/pointcloud1.9.csv
 seperate_point_cloud_viewer/pointcloud4line.csv
