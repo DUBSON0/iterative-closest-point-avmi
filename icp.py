@@ -37,6 +37,7 @@ def find_nearest_neighbors(source, target):
     return target[nearest_indices] 
 
 def voxel_downsample(points, voxel_size):
+    print("SHAPE:", points.shape)
     min_bound = np.min(points, axis=0)
     voxel_indices = np.floor((points - min_bound) / voxel_size).astype(int)
     unique_indices, inv = np.unique(voxel_indices, axis=0, return_inverse=True)
@@ -57,39 +58,40 @@ def ICP(source, target, error_threshold, max_iterations, voxel_size):
     prev_error = float('inf')
     r_total = np.eye(source.shape[1])
     t_total = np.zeros(source.shape[1])
-   # X is target, P is source 
+    #X is target, P is source 
     for iteration in range(max_iterations):
         print("iteration: ", iteration)
         nearest = find_nearest_neighbors(transformed, target)
         mu_source = center_of_mass(transformed)
         mu_target = center_of_mass(nearest)
-        print("mu_source: ", mu_source)
-        print("mu_target: ", mu_target)
+        #print("mu_source: ", mu_source)
+        #print("mu_target: ", mu_target)
         source_centered = transformed - mu_source
         target_centered = nearest - mu_target
-        print("shape of source_centered: ", source_centered.T.shape)
-        print("shape of target_centered: ", target_centered.shape)
+        #print("shape of source_centered: ", source_centered.T.shape)
+        #print("shape of target_centered: ", target_centered.shape)
         w = np.dot(source_centered.T, target_centered)
-        print("shape of w: ", w.shape)
+        #print("shape of w: ", w.shape)
         u, s, vt = np.linalg.svd(w)
-        r = np.dot(u, vt)
+        r = np.dot(vt.T, u.T)
         if np.linalg.det(r) < 0:
             vt[-1, :] *= -1
             r = np.dot(u, vt)
         t = mu_target - np.dot(r, mu_source)
         r_total = np.dot(r, r_total)
         t_total = np.dot(t_total, r.T)+t
-        print("shape of r: ", r.shape)
-        print("shape of t: ", t.shape)
+        #print("shape of r: ", r.shape)
+        #print("shape of t: ", t.shape)
         transformed = np.dot(transformed, r.T) + t
-        print("shape of transformed: ", transformed.shape)
+        #print("shape of transformed: ", transformed.shape)
         error = np.mean(np.sum((nearest-transformed) ** 2, axis=1))
-        if abs(error) < error_threshold:
+        print("Error: ", error)
+        if abs(prev_error-error) < error_threshold:
             return r, t, error
         prev_error = error
     return r_total, t_total, error
 
-def run_icp(data_file, num_scans=100, voxel_size=0.5):
+def run_icp(data_file, num_scans=100):
     global_pose = np.eye(4)
     pose_trajectory = []
     prev_points = None
@@ -100,7 +102,7 @@ def run_icp(data_file, num_scans=100, voxel_size=0.5):
             if prev_points is None:
                 prev_points = points
                 continue
-            r, t, error = ICP(prev_points, points, voxel_size=voxel_size)
+            r, t, error = ICP(prev_points, points, voxel_size=0.05, error_threshold=0.001, max_iterations=500)
             transform = np.eye(4)
             transform[:3, :3] = r
             transform[:3, 3] = t
@@ -114,13 +116,14 @@ def run_icp(data_file, num_scans=100, voxel_size=0.5):
     return global_pose, pose_trajectory
 
 def run_dual_file_icp():
-    file_path_a = 'data/teapot.csv'
-    file_path_b = 'data/tranformed-teapot.csv'
+    file_path_a = 'data/outdoor-sample-1.csv'
+    file_path_b = 'data/outdoor-sample-2.csv'
     line = open_file(file_path_a)
-    points_a = parse_line_teapot_data(line)
+    timestampe, points_a = parse_line_lidar_data(line)
+    print(points_a)
     line = open_file(file_path_b)
-    points_b = parse_line_teapot_data(line)
-    r, t, error = ICP(points_a, points_b, voxel_size=0.5, error_threshold=0.001, max_iterations=100000000)
+    timestamp, points_b = parse_line_lidar_data(line)
+    r, t, error = ICP(points_a, points_b, voxel_size=0.05, error_threshold=0.001, max_iterations=500)
     print("r: ", r)
     print("t: ", t)
     print("error: ", error)
@@ -141,7 +144,8 @@ def visualize_tranforation(r, t, source, target):
 
 def main():
     #global_pose, pose_trajectory = run_icp(data_file='data/lidardata.csv', num_scans=500, voxel_size=0.3)
-    run_dual_file_icp()
+    #run_dual_file_icp()
+    run_icp('data/outdoor-lidar-complete.csv')
     # Plot the pose trajectory
 
 if __name__ == '__main__':
