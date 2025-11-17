@@ -124,7 +124,7 @@ def plot_point_cloud(points):
 
 if __name__ == "__main__":
     # Load and plot the point cloud
-    filename = "new-one-line.txt"
+    filename = "data/teapot.csv"
     print(f"Loading point cloud from {filename}...")
     points = load_point_cloud(filename)
     print(f"Loaded {len(points)} points")
