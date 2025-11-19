@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import datetime
 
 def open_file(file_path):
     with open(file_path, 'r') as file:
@@ -37,7 +38,6 @@ def find_nearest_neighbors(source, target):
     return target[nearest_indices] 
 
 def voxel_downsample(points, voxel_size):
-    print("SHAPE:", points.shape)
     min_bound = np.min(points, axis=0)
     voxel_indices = np.floor((points - min_bound) / voxel_size).astype(int)
     unique_indices, inv = np.unique(voxel_indices, axis=0, return_inverse=True)
@@ -60,7 +60,6 @@ def ICP(source, target, error_threshold, max_iterations, voxel_size):
     t_total = np.zeros(source.shape[1])
     #X is target, P is source 
     for iteration in range(max_iterations):
-        print("iteration: ", iteration)
         nearest = find_nearest_neighbors(transformed, target)
         mu_source = center_of_mass(transformed)
         mu_target = center_of_mass(nearest)
@@ -85,24 +84,25 @@ def ICP(source, target, error_threshold, max_iterations, voxel_size):
         transformed = np.dot(transformed, r.T) + t
         #print("shape of transformed: ", transformed.shape)
         error = np.mean(np.sum((nearest-transformed) ** 2, axis=1))
-        print("Error: ", error)
         if abs(prev_error-error) < error_threshold:
             return r, t, error
         prev_error = error
     return r_total, t_total, error
 
-def run_icp(data_file, num_scans=100):
+def run_icp(data_file, num_scans=10000):
     global_pose = np.eye(4)
     pose_trajectory = []
     prev_points = None
     scans_processed = 0
+    time_segment =[] 
     with open(data_file, 'r') as file:
         for line in file:
             timestamp, points = parse_line_lidar_data(line)
+            time_segment.append(timestamp)
             if prev_points is None:
                 prev_points = points
                 continue
-            r, t, error = ICP(prev_points, points, voxel_size=0.05, error_threshold=0.001, max_iterations=500)
+            r, t, error = ICP(prev_points, points, voxel_size=15, error_threshold=0.001, max_iterations=10)
             transform = np.eye(4)
             transform[:3, :3] = r
             transform[:3, 3] = t
@@ -113,7 +113,23 @@ def run_icp(data_file, num_scans=100):
             if scans_processed >= num_scans:
                 break
             print("Scan: ", scans_processed, "Error: ", error)
-    return global_pose, pose_trajectory
+            print("Tranform:\n", transform, "\n")
+    return time_segment, global_pose, pose_trajectory
+
+def plot_pose_trajectory(pose_trajectory):
+    if not pose_trajectory:
+        return
+    positions = np.array([pose[:3, 3] for pose in pose_trajectory])
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+    ax.plot(positions[:, 0], positions[:, 1], positions[:, 2], c='tab:blue')
+    ax.scatter(positions[0, 0], positions[0, 1], positions[0, 2], c='tab:green', s=30)
+    ax.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2], c='tab:red', s=30)
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.set_title('Pose Trajectory')
+    plt.show()
 
 def run_dual_file_icp():
     file_path_a = 'data/outdoor-sample-1.csv'
@@ -123,7 +139,7 @@ def run_dual_file_icp():
     print(points_a)
     line = open_file(file_path_b)
     timestamp, points_b = parse_line_lidar_data(line)
-    r, t, error = ICP(points_a, points_b, voxel_size=0.05, error_threshold=0.001, max_iterations=500)
+    r, t, error = ICP(points_a, points_b, voxel_size=0.05, error_threshold=0.001, max_iterations=10)
     print("r: ", r)
     print("t: ", t)
     print("error: ", error)
@@ -145,8 +161,9 @@ def visualize_tranforation(r, t, source, target):
 def main():
     #global_pose, pose_trajectory = run_icp(data_file='data/lidardata.csv', num_scans=500, voxel_size=0.3)
     #run_dual_file_icp()
-    run_icp('data/outdoor-lidar-complete.csv')
-    # Plot the pose trajectory
+    time, _, pose_trajectory = run_icp('data/outdoor-lidar-complete.csv')
+    plot_pose_trajectory(pose_trajectory)
+    print("Time start: ", str(int(time[0])/1e6), "Time end: ", str(int(time[-1])/1e6))
 
 if __name__ == '__main__':
     main()
