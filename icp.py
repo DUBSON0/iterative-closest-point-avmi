@@ -2,6 +2,49 @@ import numpy as np
 import matplotlib.pyplot as plt
 import datetime
 
+class Map:
+    def __init__(self, voxel_size):
+        self.voxel_size = voxel_size
+        self.map = None
+
+    def update(self, points):
+        if self.map is None:
+            self.map = points
+        else:
+            self.map = np.concatenate([self.map, points], axis=0)
+        if self.map.shape[0] > 10000:
+            self.map = voxel_downsample(self.map, 0.05)
+
+    def plot_map(self):
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+        z = self.map[:, 2]
+        norm = (z - z.min()) / (z.max() - z.min() + 1e-12)
+        scatter = ax.scatter(self.map[:, 0], self.map[:, 1], self.map[:, 2], c=norm, cmap='coolwarm_r', s=5, label='Map')
+        fig.colorbar(scatter, ax=ax, label='Z')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        ax.legend()
+        plt.show()
+    def occupancy_grid(self):
+        grid = np.zeros((100, 100, 100))
+        for point in self.map:
+            grid[int(point[0]), int(point[1]), int(point[2])] = 1
+        return grid
+class OccupancyGrid:
+    def __init__(self, voxel_size):
+        self.voxel_size = voxel_size
+        self.grid = None
+    def update(self, points):
+        if self.grid is None:
+            self.grid = np.zeros((100, 100, 100))
+        for point in points:
+            idx = (int(point[0]), int(point[1]), int(point[2]))
+            current_prob = self.grid[idx]
+            new_prob = current_prob + (1.0 - current_prob) * 0.5
+            self.grid[idx] = new_prob
+
 def open_file(file_path):
     with open(file_path, 'r') as file:
         return file.read()
@@ -22,10 +65,10 @@ def parse_line_lidar_data(data):
 
 def parse_line_teapot_data(data):
     elements = data.strip().replace(",", " ").replace("\n", " ").split()
-    print("len: ", len(elements))
+    #print("len: ", len(elements))
     float_values = [float(v) for v in elements]
     points = np.array([float_values[i:i+3] for i in range(0, len(float_values), 3)])
-    print("len: ", len(points))
+    #print("len: ", len(points))
     return points
 
 
@@ -51,7 +94,7 @@ def voxel_downsample(points, voxel_size):
     return downsampled
 
 
-def ICP(source, target, error_threshold, max_iterations, voxel_size):
+def ICP(source, target, error_threshold, max_iterations, voxel_size, map=None):
     source = voxel_downsample(source, voxel_size)
     target = voxel_downsample(target, voxel_size)
     transformed = source.copy()
@@ -82,14 +125,19 @@ def ICP(source, target, error_threshold, max_iterations, voxel_size):
         #print("shape of r: ", r.shape)
         #print("shape of t: ", t.shape)
         transformed = np.dot(transformed, r.T) + t
+        #print("shape of transformed: ", transformed)
         #print("shape of transformed: ", transformed.shape)
         error = np.mean(np.sum((nearest-transformed) ** 2, axis=1))
         if abs(prev_error-error) < error_threshold:
             return r, t, error
         prev_error = error
+        if map is not None:
+            #print("Updating map")
+            #print("shape of transformed: ", transformed.shape)
+            map.update(np.dot(source, r.T) + t)
     return r_total, t_total, error
 
-def run_icp(data_file, num_scans=10000):
+def run_icp(data_file, num_scans=10, map=None):
     global_pose = np.eye(4)
     pose_trajectory = []
     prev_points = None
@@ -102,7 +150,8 @@ def run_icp(data_file, num_scans=10000):
             if prev_points is None:
                 prev_points = points
                 continue
-            r, t, error = ICP(prev_points, points, voxel_size=15, error_threshold=0.001, max_iterations=10)
+            r, t, error = ICP(prev_points, points, voxel_size=0.6, error_threshold=0.001, max_iterations=10, map=map)
+
             transform = np.eye(4)
             transform[:3, :3] = r
             transform[:3, 3] = t
@@ -113,7 +162,7 @@ def run_icp(data_file, num_scans=10000):
             if scans_processed >= num_scans:
                 break
             print("Scan: ", scans_processed, "Error: ", error)
-            print("Tranform:\n", transform, "\n")
+            #print("Tranform:\n", transform, "\n")
     return time_segment, global_pose, pose_trajectory
 
 def plot_pose_trajectory(pose_trajectory):
@@ -140,9 +189,9 @@ def run_dual_file_icp():
     line = open_file(file_path_b)
     timestamp, points_b = parse_line_lidar_data(line)
     r, t, error = ICP(points_a, points_b, voxel_size=0.05, error_threshold=0.001, max_iterations=10)
-    print("r: ", r)
-    print("t: ", t)
-    print("error: ", error)
+    #print("r: ", r)
+    #print("t: ", t)
+    #print("error: ", error)
     visualize_tranforation(r, t, points_a, points_b)
 
 def visualize_tranforation(r, t, source, target):
@@ -158,12 +207,14 @@ def visualize_tranforation(r, t, source, target):
     ax.legend()
     plt.show()
 
+
 def main():
     #global_pose, pose_trajectory = run_icp(data_file='data/lidardata.csv', num_scans=500, voxel_size=0.3)
     #run_dual_file_icp()
-    time, _, pose_trajectory = run_icp('data/outdoor-lidar-complete.csv')
+    map = Map(voxel_size=0.003)
+    time, _, pose_trajectory = run_icp('data/lidardata.csv', map=map, num_scans=1000)
     plot_pose_trajectory(pose_trajectory)
     print("Time start: ", str(int(time[0])/1e6), "Time end: ", str(int(time[-1])/1e6))
-
+    map.plot_map()
 if __name__ == '__main__':
     main()
