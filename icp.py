@@ -32,22 +32,44 @@ class Map:
         for point in self.map:
             grid[int(point[0]), int(point[1]), int(point[2])] = 1
         return grid
+
 class OccupancyGrid:
-    def __init__(self, voxel_size):
-        self.voxel_size = voxel_size
-        self.grid = None
-    def update(self, points):
-        if self.grid is None:
-            self.grid = np.zeros((100, 100, 100))
-        for point in points:
-            idx = (int(point[0]), int(point[1]), int(point[2]))
-            current_prob = self.grid[idx]
-            new_prob = current_prob + (1.0 - current_prob) * 0.5
-            self.grid[idx] = new_prob
+    def __init__(self, map_resolution_m, map_size_m):
+        self.map_resolution_m = map_resolution_m
+        self.map_size_m = map_size_m
+        self.map_ratio = int(self.map_size_m/self.map_resolution_m)
+        self.grid = np.zeros((self.map_ratio, self.map_ratio, self.map_ratio))
+        self.grid[:] = 0.5
+    def update(self, points, pose):
+        floor_points = np.floor(points/self.map_resolution_m).astype(int)
+        for point in floor_points:
+            if point[0]< self.grid.shape[0] and point[1]< self.grid.shape[1] and point[2]< self.grid.shape[2] and point[0]>=0 and point[1]>=0 and point[2]>=0:
+                self.grid[point[0]][point[1]][point[2]] = 1
+        print("grid: ", self.grid.shape)
+        return self.grid
+    def plot_grid(self):
+        # Only plot x and y where grid is occupied
+        occupied = np.argwhere(self.grid == 1)
+        fig = plt.figure()
+        ax = fig.add_subplot(111)
+        ax.scatter(occupied[:, 0], occupied[:, 1], c='tab:blue', s=5, label='Grid')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.legend()
+        plt.show()
 
 def open_file(file_path):
     with open(file_path, 'r') as file:
         return file.read()
+    
+def write_grid_to_file(grid, file_path):
+    with open(file_path, 'w') as file:
+        for x in range(grid.shape[0]):
+            for y in range(grid.shape[1]):
+                for z in range(grid.shape[2]):
+                    file.write(str(grid[x][y][z]) + " ")
+                file.write("\n")
+        file.write("\n")
 
 def parse_line_lidar_data(data):
     elements = data.strip().replace(";", " ").split()
@@ -71,7 +93,6 @@ def parse_line_teapot_data(data):
     #print("len: ", len(points))
     return points
 
-
 def center_of_mass(points):
     return np.array(np.mean(points, axis=0))
 
@@ -94,7 +115,7 @@ def voxel_downsample(points, voxel_size):
     return downsampled
 
 
-def ICP(source, target, error_threshold, max_iterations, voxel_size, map=None):
+def ICP(source, target, error_threshold, max_iterations, voxel_size, map=None, occupancy_grid=None):
     source = voxel_downsample(source, voxel_size)
     target = voxel_downsample(target, voxel_size)
     transformed = source.copy()
@@ -106,14 +127,9 @@ def ICP(source, target, error_threshold, max_iterations, voxel_size, map=None):
         nearest = find_nearest_neighbors(transformed, target)
         mu_source = center_of_mass(transformed)
         mu_target = center_of_mass(nearest)
-        #print("mu_source: ", mu_source)
-        #print("mu_target: ", mu_target)
         source_centered = transformed - mu_source
         target_centered = nearest - mu_target
-        #print("shape of source_centered: ", source_centered.T.shape)
-        #print("shape of target_centered: ", target_centered.shape)
         w = np.dot(source_centered.T, target_centered)
-        #print("shape of w: ", w.shape)
         u, s, vt = np.linalg.svd(w)
         r = np.dot(vt.T, u.T)
         if np.linalg.det(r) < 0:
@@ -122,22 +138,16 @@ def ICP(source, target, error_threshold, max_iterations, voxel_size, map=None):
         t = mu_target - np.dot(r, mu_source)
         r_total = np.dot(r, r_total)
         t_total = np.dot(t_total, r.T)+t
-        #print("shape of r: ", r.shape)
-        #print("shape of t: ", t.shape)
         transformed = np.dot(transformed, r.T) + t
-        #print("shape of transformed: ", transformed)
-        #print("shape of transformed: ", transformed.shape)
         error = np.mean(np.sum((nearest-transformed) ** 2, axis=1))
         if abs(prev_error-error) < error_threshold:
             return r, t, error
         prev_error = error
-        if map is not None:
-            #print("Updating map")
-            #print("shape of transformed: ", transformed.shape)
-            map.update(np.dot(source, r.T) + t)
+    if map is not None:
+        map.update(np.dot(source, r.T) + t)
     return r_total, t_total, error
 
-def run_icp(data_file, num_scans=10, map=None):
+def run_icp(data_file, num_scans=10, map=None, occupancy_grid=None):
     global_pose = np.eye(4)
     pose_trajectory = []
     prev_points = None
@@ -150,12 +160,13 @@ def run_icp(data_file, num_scans=10, map=None):
             if prev_points is None:
                 prev_points = points
                 continue
-            r, t, error = ICP(prev_points, points, voxel_size=0.6, error_threshold=0.001, max_iterations=10, map=map)
-
+            r, t, error = ICP(prev_points, points, voxel_size=0.6, error_threshold=0.001, max_iterations=10, map=map, occupancy_grid=occupancy_grid)
             transform = np.eye(4)
             transform[:3, :3] = r
             transform[:3, 3] = t
             global_pose = np.dot(global_pose, transform)
+            if occupancy_grid is not None:
+                occupancy_grid.update(np.dot(points, r.T) + t, global_pose)
             pose_trajectory.append(global_pose.copy())
             prev_points = points
             scans_processed += 1
@@ -212,7 +223,10 @@ def main():
     #global_pose, pose_trajectory = run_icp(data_file='data/lidardata.csv', num_scans=500, voxel_size=0.3)
     #run_dual_file_icp()
     map = Map(voxel_size=0.003)
-    time, _, pose_trajectory = run_icp('data/lidardata.csv', map=map, num_scans=1000)
+    occupancy_grid = OccupancyGrid(map_resolution_m=0.5, map_size_m=20)
+    time, _, pose_trajectory = run_icp('data/outdoor-lidar-complete.csv', map=map, num_scans=20, occupancy_grid=occupancy_grid)
+    write_grid_to_file(occupancy_grid.grid, 'data/occupancy_grid.txt')
+    occupancy_grid.plot_grid()
     plot_pose_trajectory(pose_trajectory)
     print("Time start: ", str(int(time[0])/1e6), "Time end: ", str(int(time[-1])/1e6))
     map.plot_map()
