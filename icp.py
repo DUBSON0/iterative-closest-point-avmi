@@ -41,19 +41,46 @@ class OccupancyGrid:
     def __init__(self, map_resolution_m, map_size_m):
         self.lidar_z_position = 1
         self.scan_vertical_range = 1
+        self.l_occ  = np.log(0.9 / 0.1)  # ≈ 2.2   // hit  → occupied
+        self.l_free = np.log(0.3 / 0.7)  # ≈ -0.85 // miss → free
+        self.l_min = -10
+        self.l_max = 50   # clamping bounds
         self.map_resolution_m = map_resolution_m
         self.map_size_m = map_size_m
         self.map_ratio = int(self.map_size_m/self.map_resolution_m)
         self.grid = np.zeros((self.map_ratio, self.map_ratio))
         self.grid[:] = 0.5
-        self.grid_origin = np.floor(self.map_ratio/2).astype(int)
+        self.grid_origin_offset = np.floor(self.map_ratio/2).astype(int)
     def update(self, points, pose):
         # Use Bayes Filter
+        hit_or_miss_grid_sensor_model = np.zeros((self.map_ratio, self.map_ratio))
+        hit_or_miss_grid_sensor_model[:] = 0.5
         floor_points = np.floor(points/self.map_resolution_m).astype(int) # This is to normalize the value of the lidar points to the size of the grid cells.
-        for point in floor_points:
-            if point[2] > ((self.lidar_z_position-self.scan_vertical_range)/self.map_resolution_m) and point[2] < ((self.lidar_z_position+self.scan_vertical_range)/self.map_resolution_m):
-                self.grid[point[0]+self.grid_origin][point[1]+self.grid_origin] = 1
-        return self.grid
+        measurement_zt = {(x,y) for x,y,z in floor_points}
+        current_pose_with_origin_offset = (pose[:3, 3]/self.map_resolution_m)+self.grid_origin_offset
+        print("Current POSE NO OFFSET: ", pose[:3,3])
+        print("Current Pose with ORIGIN OFFSET",current_pose_with_origin_offset)
+        for x,y in np.ndindex(self.map_ratio, self.map_ratio):
+            if (x,y) in measurement_zt:
+                hit_or_miss_grid_sensor_model[x][y]=1
+                theta = np.atan2(x,y)
+                for i in range(0,len(np.hypot(x,y))):
+                    x_chord = int(i*np.sin(theta))
+                    y_chord = int(i*np.cos(theta))
+                    hit_or_miss_grid_sensor_model[x_chord][y_chord]=1
+
+
+        for x,y in np.ndindex(self.map_ratio, self.map_ratio):
+            lt1= np.log((self.grid[x][y])/(1-self.grid[x][y]))
+            if (x,y) in measurement_zt:
+                l_t = lt1 + self.l_occ
+            else: 
+                l_t = lt1 + self.l_free
+         
+
+
+
+
     def plot_grid(self):
         fig, ax = plt.subplots(figsize=(8, 8))
         n = self.grid.shape[0]
