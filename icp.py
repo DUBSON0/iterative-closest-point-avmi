@@ -56,39 +56,54 @@ class OccupancyGrid:
         hit_or_miss_grid_sensor_model = np.zeros((self.map_ratio, self.map_ratio))
         hit_or_miss_grid_sensor_model[:] = 0.5
         floor_points = np.floor(points/self.map_resolution_m).astype(int) # This is to normalize the value of the lidar points to the size of the grid cells.
-        measurement_zt = {(x,y) for x,y,z in floor_points}
+        measurement_zt = {(x+self.grid_origin_offset,y+self.grid_origin_offset) for x,y,z in floor_points}
         current_pose_with_origin_offset = (pose[:3, 3]/self.map_resolution_m)+self.grid_origin_offset
         print("Current POSE NO OFFSET: ", pose[:3,3])
         print("Current Pose with ORIGIN OFFSET",current_pose_with_origin_offset)
         for x,y in np.ndindex(self.map_ratio, self.map_ratio):
             if (x,y) in measurement_zt:
+                dx = x - self.grid_origin_offset
+                dy = y -self.grid_origin_offset
                 hit_or_miss_grid_sensor_model[x][y]=1
-                theta = np.atan2(x,y)
-                for i in range(0,len(np.hypot(x,y))):
-                    x_chord = int(i*np.sin(theta))
-                    y_chord = int(i*np.cos(theta))
-                    hit_or_miss_grid_sensor_model[x_chord][y_chord]=1
-
+                theta = np.atan2(dx,dy)
+                for i in range(0,int(np.hypot(dx,dy))):
+                    x_chord = self.grid_origin_offset + int(i*np.sin(theta))
+                    y_chord = self.grid_origin_offset + int(i*np.cos(theta))
+                    hit_or_miss_grid_sensor_model[x_chord][y_chord]=0
+        self.write_grid_to_file(hit_or_miss_grid_sensor_model, "Hit_or_Miss.csv")
 
         for x,y in np.ndindex(self.map_ratio, self.map_ratio):
             lt1= np.log((self.grid[x][y])/(1-self.grid[x][y]))
             if (x,y) in measurement_zt:
-                l_t = lt1 + self.l_occ
+                if hit_or_miss_grid_sensor_model[x][y] == 1:
+                    lt = lt1 + self.l_occ
+                else: 
+                    lt = lt1 + self.l_free
             else: 
-                l_t = lt1 + self.l_free
+                lt = lt1
+            lt = max(self.l_min, min(self.l_max, lt))
+            self.grid[x][y] = 1-1/(1+np.exp(lt))
+
          
 
 
 
-
-    def plot_grid(self):
+    def plot_occupancy_grid(self):
+        self.plot_grid(self.grid)
+    def plot_grid(self, grid):
         fig, ax = plt.subplots(figsize=(8, 8))
-        n = self.grid.shape[0]
+        n = grid.shape[0]
         extent = [0, n, 0, n]
-        show_grid = np.zeros_like(self.grid)
-        show_grid[self.grid == 1] = 1
-        cmap = plt.cm.Blues
-        ax.imshow(show_grid.T, origin='lower', extent=extent, cmap=cmap, vmin=0, vmax=1, interpolation='none')
+
+        # Create an RGB image (n, n, 3) initialized to white
+        show_grid = np.ones((n, n, 3))
+
+        # Set black for occupied (1), grey for unknown (0.5), white for free (0)
+        show_grid[grid == 1] = [0, 0, 0]          # black
+        show_grid[grid == 0.5] = [0.5, 0.5, 0.5]  # grey
+        show_grid[grid == 0] = [1, 1, 1]          # white (already default, but explicit)
+
+        ax.imshow(show_grid.transpose(1, 0, 2), origin='lower', extent=extent, interpolation='none')
         ax.set_xticks(np.arange(0, n+1, 1))
         ax.set_yticks(np.arange(0, n+1, 1))
         ax.grid(which='both', color='gray', linestyle='-', linewidth=0.7)
@@ -99,13 +114,18 @@ class OccupancyGrid:
         ax.set_title('Occupancy Grid')
         ax.set_xticklabels([])
         ax.set_yticklabels([])
+
+        # Plot the origin offset point
+        ax.plot(self.grid_origin_offset, self.grid_origin_offset, marker='o', color='red', markersize=10, label='UGV')
+        ax.legend(loc='upper right')
+
         plt.tight_layout()
         plt.show()
-    def write_grid_to_file(self, file_path):
+    def write_grid_to_file(self, grid, file_path):
         with open(file_path, 'w') as file:
-            for x in range(self.grid.shape[0]):
-                for y in range(self.grid.shape[1]):
-                    file.write(str(self.grid[x][y]) + " ")
+            for x in range(grid.shape[0]):
+                for y in range(grid.shape[1]):
+                    file.write(str(grid[x][y]) + " ")
                 file.write("\n")
             file.write("\n")
 
@@ -263,9 +283,9 @@ def visualize_tranforation(r, t, source, target):
 def main():
     map = Map(voxel_size=0.003)
     occupancy_grid = OccupancyGrid(map_resolution_m=0.5, map_size_m=50)
-    time, _, pose_trajectory = run_icp('data/lidardata.csv', map=map, num_scans=5000, occupancy_grid=occupancy_grid)
-    occupancy_grid.write_grid_to_file('data/occupancy_grid.txt')
-    occupancy_grid.plot_grid()
+    tiMe, _, pose_trajectory = run_icp('data/lidardata.csv', map=map, num_scans=500, occupancy_grid=occupancy_grid)
+    #Occupancy_grid.write_grid_to_file('data/occupancy_grid.txt')
+    occupancy_grid.plot_occupancy_grid()
     plot_pose_trajectory(pose_trajectory)
     print("Time start: ", str(int(time[0])/1e6), "Time end: ", str(int(time[-1])/1e6))
     map.plot_2d_map()
