@@ -14,8 +14,7 @@ class Map:
             self.map = np.concatenate([self.map, points], axis=0)
         if self.map.shape[0] > 10000:
             self.map = voxel_downsample(self.map, 0.05)
-
-    def plot_map(self):
+    def plot_3d_voxel_map(self):
         fig = plt.figure()
         ax = fig.add_subplot(111, projection='3d')
         z = self.map[:, 2]
@@ -27,49 +26,66 @@ class Map:
         ax.set_zlabel('Z')
         ax.legend()
         plt.show()
-    def occupancy_grid(self):
-        grid = np.zeros((100, 100, 100))
-        for point in self.map:
-            grid[int(point[0]), int(point[1]), int(point[2])] = 1
-        return grid
+    def plot_2d_map(self):
+        fig = plt.figure()
+        ax = fig.add_subplot(111)
+        ax.scatter(self.map[:, 0], self.map[:, 1], c='tab:blue', s=2, label='2D Map')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_title('2D Point Map (XY Projection)')
+        ax.legend()
+        plt.axis('equal')
+        plt.show()
 
 class OccupancyGrid:
     def __init__(self, map_resolution_m, map_size_m):
+        self.lidar_z_position = 1
+        self.scan_vertical_range = 1
         self.map_resolution_m = map_resolution_m
         self.map_size_m = map_size_m
         self.map_ratio = int(self.map_size_m/self.map_resolution_m)
-        self.grid = np.zeros((self.map_ratio, self.map_ratio, self.map_ratio))
+        self.grid = np.zeros((self.map_ratio, self.map_ratio))
         self.grid[:] = 0.5
+        self.grid_origin = np.floor(self.map_ratio/2).astype(int)
     def update(self, points, pose):
-        floor_points = np.floor(points/self.map_resolution_m).astype(int)
+        # Use Bayes Filter
+        floor_points = np.floor(points/self.map_resolution_m).astype(int) # This is to normalize the value of the lidar points to the size of the grid cells.
         for point in floor_points:
-            if point[0]< self.grid.shape[0] and point[1]< self.grid.shape[1] and point[2]< self.grid.shape[2] and point[0]>=0 and point[1]>=0 and point[2]>=0:
-                self.grid[point[0]][point[1]][point[2]] = 1
-        print("grid: ", self.grid.shape)
+            if point[2] > ((self.lidar_z_position-self.scan_vertical_range)/self.map_resolution_m) and point[2] < ((self.lidar_z_position+self.scan_vertical_range)/self.map_resolution_m):
+                self.grid[point[0]+self.grid_origin][point[1]+self.grid_origin] = 1
         return self.grid
     def plot_grid(self):
-        # Only plot x and y where grid is occupied
-        occupied = np.argwhere(self.grid == 1)
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        ax.scatter(occupied[:, 0], occupied[:, 1], c='tab:blue', s=5, label='Grid')
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.legend()
+        fig, ax = plt.subplots(figsize=(8, 8))
+        n = self.grid.shape[0]
+        extent = [0, n, 0, n]
+        show_grid = np.zeros_like(self.grid)
+        show_grid[self.grid == 1] = 1
+        cmap = plt.cm.Blues
+        ax.imshow(show_grid.T, origin='lower', extent=extent, cmap=cmap, vmin=0, vmax=1, interpolation='none')
+        ax.set_xticks(np.arange(0, n+1, 1))
+        ax.set_yticks(np.arange(0, n+1, 1))
+        ax.grid(which='both', color='gray', linestyle='-', linewidth=0.7)
+        ax.set_xlim(0, n)
+        ax.set_ylim(0, n)
+        ax.set_xlabel('X (Grid index)')
+        ax.set_ylabel('Y (Grid index)')
+        ax.set_title('Occupancy Grid')
+        ax.set_xticklabels([])
+        ax.set_yticklabels([])
+        plt.tight_layout()
         plt.show()
+    def write_grid_to_file(self, file_path):
+        with open(file_path, 'w') as file:
+            for x in range(self.grid.shape[0]):
+                for y in range(self.grid.shape[1]):
+                    file.write(str(self.grid[x][y]) + " ")
+                file.write("\n")
+            file.write("\n")
 
 def open_file(file_path):
     with open(file_path, 'r') as file:
         return file.read()
     
-def write_grid_to_file(grid, file_path):
-    with open(file_path, 'w') as file:
-        for x in range(grid.shape[0]):
-            for y in range(grid.shape[1]):
-                for z in range(grid.shape[2]):
-                    file.write(str(grid[x][y][z]) + " ")
-                file.write("\n")
-        file.write("\n")
 
 def parse_line_lidar_data(data):
     elements = data.strip().replace(";", " ").split()
@@ -115,7 +131,7 @@ def voxel_downsample(points, voxel_size):
     return downsampled
 
 
-def ICP(source, target, error_threshold, max_iterations, voxel_size, map=None, occupancy_grid=None):
+def ICP(source, target, error_threshold, max_iterations, voxel_size):
     source = voxel_downsample(source, voxel_size)
     target = voxel_downsample(target, voxel_size)
     transformed = source.copy()
@@ -143,8 +159,6 @@ def ICP(source, target, error_threshold, max_iterations, voxel_size, map=None, o
         if abs(prev_error-error) < error_threshold:
             return r, t, error
         prev_error = error
-    if map is not None:
-        map.update(np.dot(source, r.T) + t)
     return r_total, t_total, error
 
 def run_icp(data_file, num_scans=10, map=None, occupancy_grid=None):
@@ -160,20 +174,20 @@ def run_icp(data_file, num_scans=10, map=None, occupancy_grid=None):
             if prev_points is None:
                 prev_points = points
                 continue
-            r, t, error = ICP(prev_points, points, voxel_size=0.6, error_threshold=0.001, max_iterations=10, map=map, occupancy_grid=occupancy_grid)
+            r, t, error = ICP(prev_points, points, voxel_size=0.6, error_threshold=0.001, max_iterations=10)
             transform = np.eye(4)
             transform[:3, :3] = r
             transform[:3, 3] = t
             global_pose = np.dot(global_pose, transform)
-            if occupancy_grid is not None:
-                occupancy_grid.update(np.dot(points, r.T) + t, global_pose)
             pose_trajectory.append(global_pose.copy())
             prev_points = points
             scans_processed += 1
+            occupancy_grid.update(np.dot(points, r.T) + t, global_pose)
+            if map:
+                map.update(points)
             if scans_processed >= num_scans:
                 break
             print("Scan: ", scans_processed, "Error: ", error)
-            #print("Tranform:\n", transform, "\n")
     return time_segment, global_pose, pose_trajectory
 
 def plot_pose_trajectory(pose_trajectory):
@@ -220,15 +234,13 @@ def visualize_tranforation(r, t, source, target):
 
 
 def main():
-    #global_pose, pose_trajectory = run_icp(data_file='data/lidardata.csv', num_scans=500, voxel_size=0.3)
-    #run_dual_file_icp()
     map = Map(voxel_size=0.003)
-    occupancy_grid = OccupancyGrid(map_resolution_m=0.5, map_size_m=20)
-    time, _, pose_trajectory = run_icp('data/outdoor-lidar-complete.csv', map=map, num_scans=20, occupancy_grid=occupancy_grid)
-    write_grid_to_file(occupancy_grid.grid, 'data/occupancy_grid.txt')
+    occupancy_grid = OccupancyGrid(map_resolution_m=0.5, map_size_m=50)
+    time, _, pose_trajectory = run_icp('data/lidardata.csv', map=map, num_scans=5000, occupancy_grid=occupancy_grid)
+    occupancy_grid.write_grid_to_file('data/occupancy_grid.txt')
     occupancy_grid.plot_grid()
     plot_pose_trajectory(pose_trajectory)
     print("Time start: ", str(int(time[0])/1e6), "Time end: ", str(int(time[-1])/1e6))
-    map.plot_map()
+    map.plot_2d_map()
 if __name__ == '__main__':
     main()
