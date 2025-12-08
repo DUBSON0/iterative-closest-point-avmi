@@ -1,0 +1,169 @@
+/**
+ * This example shows how to use SSL_Client to connect to SSE (Server-Sent Events) server.
+ * 
+ * Locate the sse.php on your PHP web server to test.
+ *
+ * Email: suwatchai@outlook.com
+ *
+ * Github: https://github.com/mobizt/ESP_SSLSClient
+ *
+ * Copyright (c) 2025 mobizt
+ *
+ */
+
+#include <Arduino.h>
+#if defined(ESP32) || defined(ARDUINO_RASPBERRY_PI_PICO_W) || defined(ARDUINO_GIGA)
+#include <WiFi.h>
+#elif defined(ESP8266)
+#include <ESP8266WiFi.h>
+#elif __has_include(<WiFiNINA.h>) || defined(ARDUINO_NANO_RP2040_CONNECT)
+#include <WiFiNINA.h>
+#elif __has_include(<WiFi101.h>)
+#include <WiFi101.h>
+#elif __has_include(<WiFiS3.h>) || defined(ARDUINO_UNOWIFIR4)
+#include <WiFiS3.h>
+#elif __has_include(<WiFiC3.h>) || defined(ARDUINO_PORTENTA_C33)
+#include <WiFiC3.h>
+#elif __has_include(<WiFi.h>)
+#include <WiFi.h>
+#endif
+
+#define ENABLE_DEBUG        // To enable debugging
+#define ENABLE_ERROR_STRING // To show details in error
+#define DEBUG_PORT Serial   // To define the serial port for debug printing
+
+// When use in insecure mode (no certificate and fingerprint verification).
+// This can save memory and program space usage.
+#define SSLCLIENT_INSECURE_ONLY
+
+// SSE is an asynchronous, unidirectional stream protocol (Half Duplex logic) 
+// that requires the efficiency of a Full Duplex transport layer (TCP/IP) to function effectively.
+// #define SSLCLIENT_HALF_DUPLEX
+
+// When pre-memory allocation are prefered (stack memory used).
+// Don't define when dynamic memory allocation is prefered (heap or PSRAM memory used).
+// #define STATIC_IN_BUFFER_SIZE 2048
+// #define STATIC_OUT_BUFFER_SIZE 1024
+// #define STATIC_X509_CONTEXT
+// #define STATIC_SSLCLIENT_CONTEXT
+
+// For using external BearSSL library.
+// When othere libraries that contain BearSSL source files are used
+// with this library, define this macro to exclude the internal BearSSL library
+// to be compiled thats makes compilation error.
+// #define BSSL_BUILD_EXTERNAL_CORE
+
+// If board supports the filesystem APIs, to use CertStore class.
+// #define ENABLE_FS
+
+#include <ESP_SSLClient.h>
+#include <WiFiClient.h>
+
+#define WIFI_SSID "WIFI_AP"
+#define WIFI_PASSWORD "WIFI_PASSWORD"
+
+ESP_SSLClient ssl_client;
+
+WiFiClient basic_client;
+
+#if defined(ARDUINO_RASPBERRY_PI_PICO_W)
+WiFiMulti multi;
+#endif
+
+
+String host = "your_server_ip_or_host";
+String uri = "/sse.php"; // if sse.php is located in the root directory.
+uint16_t port = 443;
+
+bool connect()
+{
+    Serial.println();
+    Serial.print("Connecting to server...");
+
+    if (ssl_client.connect(host.c_str(), port))
+    {
+        Serial.println(" ok");
+
+        String header = "GET ";
+        header += uri;
+        header += " HTTP/1.1\r\n";
+        header += "Host: ";
+        header += host;
+        header += "\r\n\r\n";
+
+        int ret = ssl_client.print(header);
+        return ret == header.length();
+    }
+    else
+    {
+        ssl_client.stop();
+        Serial.println(" failed\n");
+        delay(2000);
+    }
+
+    return false;
+}
+
+void setup()
+{
+    Serial.begin(115200);
+
+    Serial.print("ESP_Client version ");
+    Serial.println(ESP_SSLCLIENT_VERSION);
+
+#if defined(ARDUINO_RASPBERRY_PI_PICO_W)
+    multi.addAP(WIFI_SSID, WIFI_PASSWORD);
+    multi.run();
+#else
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+#endif
+
+    Serial.print("Connecting to Wi-Fi");
+    unsigned long ms = millis();
+    while (WiFi.status() != WL_CONNECTED)
+    {
+        Serial.print(".");
+        delay(300);
+#if defined(ARDUINO_RASPBERRY_PI_PICO_W)
+        if (millis() - ms > 10000)
+            break;
+#endif
+    }
+    Serial.println();
+    Serial.print("Connected with IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.println();
+
+    // ignore server ssl certificate verification
+    ssl_client.setInsecure();
+
+    // Set the receive and transmit buffers size in bytes for memory allocation (512 to 16384).
+    ssl_client.setBufferSizes(1024 /* rx */, 512 /* tx */);
+
+    /** Call setDebugLevel(level) to set the debug
+     * esp_ssl_debug_none = 0
+     * esp_ssl_debug_error = 1
+     * esp_ssl_debug_warn = 2
+     * esp_ssl_debug_info = 3
+     * esp_ssl_debug_dump = 4
+     */
+    ssl_client.setDebugLevel(1);
+
+    // Assign the basic client
+    // Due to the basic_client pointer is assigned, to avoid dangling pointer, basic_client should be existed
+    // as long as it was used by ssl_client for transportation.
+    ssl_client.setClient(&basic_client);
+
+     connect();
+}
+
+void loop()
+{
+    if (!ssl_client.connected() && !connect())
+        return;
+
+    while (ssl_client.connected() && ssl_client.available())
+    {
+        Serial.print(ssl_client.readStringUntil('\r'));
+    }
+}
