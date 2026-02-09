@@ -6,7 +6,7 @@ import pyvista as pv
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Teapot point cloud viewer")
+    parser = argparse.ArgumentParser(description="PCMan point cloud viewer")
     base = Path(__file__).resolve().parent
     default_path = base / "data" / "teapot.csv"
     export_path = base / "data" / "tranformed-teapot.csv"
@@ -19,7 +19,7 @@ def parse_args():
     parser.add_argument("--rotate-y", type=float, default=0.0)
     parser.add_argument("--rotate-z", type=float, default=0.0)
     parser.add_argument("--translate", type=float, nargs=3, default=(0.0, 0.0, 0.0))
-    parser.add_argument("--export", default=str(export_path))
+    parser.add_argument("--export", "--output", dest="export", default=str(export_path))
     return parser.parse_args()
 
 
@@ -64,20 +64,29 @@ def main():
         args.translate,
     )
     export_points(transformed, args.export)
-    point_cloud = pv.PolyData(transformed)
-    point_cloud["z"] = transformed[:, 2]
+    original_cloud = pv.PolyData(points)
+    transformed_cloud = pv.PolyData(transformed)
+    transformed_cloud["z"] = transformed[:, 2]
     plotter = pv.Plotter()
     plotter.add_mesh(
-        point_cloud,
-        scalars="z",
-        cmap=args.cmap,
+        original_cloud,
+        color="black",
         point_size=args.point_size,
         render_points_as_spheres=False,
+        label="Original",
+    )
+    plotter.add_mesh(
+        transformed_cloud,
+        color="red",
+        point_size=args.point_size,
+        render_points_as_spheres=False,
+        label="Transformed",
     )
     plotter.add_axes(line_width=2, labels_off=False)
+    plotter.add_legend()
     plotter.show_grid()
     plotter.add_text(
-        f"Transformed Teapot ({len(transformed)} points)",
+        f"Transformed Point Cloud ({len(transformed)} points)",
         font_size=12,
         position="upper_left",
     )
