@@ -54,6 +54,8 @@ def run_slam(cfg):
     max_iterations = icp_cfg.get("max_iterations", 5000)
     voxel_size = icp_cfg.get("voxel_size", 0.01)
     error_reject_threshold = icp_cfg.get("error_reject_threshold", 0.5)
+    icp_method = icp_cfg.get("method", "point_to_line")
+    normal_k = icp_cfg.get("normal_k", 10)
 
     feat_cfg = cfg.get("features", {})
     # alignment_method: "rotation_search" | "features" | "both" | "none"
@@ -209,6 +211,8 @@ def run_slam(cfg):
                 voxel_size=voxel_size,
                 R_init=R_init,
                 t_init=t_init,
+                method=icp_method,
+                normal_k=normal_k,
             )
             if error > error_reject_threshold:
                 print(f"Scan {scans_processed}: error {error:.6f} too high, skipping")

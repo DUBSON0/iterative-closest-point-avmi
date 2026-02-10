@@ -6,10 +6,13 @@
 data_file: "data/ugvlidar-full.csv"
 
 # --- ICP parameters ---
+# method: "point_to_line" (recommended for 2D) or "point_to_point" (classic)
 icp:
+  method: "point_to_line"
+  normal_k: 10                  # neighbours for normal estimation (point_to_line only)
   voxel_size: 0.06
   error_threshold: 1.0e-10
-  max_iterations: 10000000000
+  max_iterations: 100
   error_reject_threshold: 0.05  # skip scan if ICP error > this value
 
 # --- Pre-alignment (handles large inter-scan rotations) ---
@@ -22,12 +25,12 @@ features:
   method: "rotation_search"
 
   # ─ correlative rotation search ─
-  rotation_voxel_size: 0.03    # coarse voxel for the angle sweep (meters)
+  rotation_voxel_size: 0.3   # coarse voxel for the angle sweep (meters)
   angle_step_coarse: 2.0      # degrees per step in the full [-180°,180°) sweep
   angle_step_fine: 0.2        # degrees per step in the refinement band
 
   # ─ feature-based alignment (used when method is "features" or "both") ─
-  voxel_size: 0.2       # coarse downsample for feature extraction (meters)
+  voxel_size: 0.3       # coarse downsample for feature extraction (meters)
   k_curvature: 10       # neighbours used for curvature estimation
   top_n: 100            # max keypoints per scan
   min_kp_dist: 0.3      # non-max suppression radius (meters)
