@@ -37,10 +37,11 @@ def find_nearest_neighbors(source, target):
     return target[nearest_indices] 
 
 def voxel_downsample(points, voxel_size):
+    dim = points.shape[1]
     min_bound = np.min(points, axis=0)
     voxel_indices = np.floor((points - min_bound) / voxel_size).astype(int)
     unique_indices, inv = np.unique(voxel_indices, axis=0, return_inverse=True)
-    downsampled = np.zeros((len(unique_indices), 3))
+    downsampled = np.zeros((len(unique_indices), dim))
     counts = np.zeros(len(unique_indices))
     for i in range(len(points)):
         idx = inv[i]
@@ -50,13 +51,20 @@ def voxel_downsample(points, voxel_size):
     return downsampled
 
 
-def ICP(source, target, error_threshold, max_iterations, voxel_size):
+def ICP(source, target, error_threshold, max_iterations, voxel_size, R_init=None, t_init=None):
     source = voxel_downsample(source, voxel_size)
     target = voxel_downsample(target, voxel_size)
-    transformed = source.copy()
+
+    if R_init is not None and t_init is not None:
+        transformed = source @ R_init.T + t_init
+        r_total = R_init.copy()
+        t_total = t_init.copy()
+    else:
+        transformed = source.copy()
+        r_total = np.eye(source.shape[1])
+        t_total = np.zeros(source.shape[1])
+
     prev_error = float('inf')
-    r_total = np.eye(source.shape[1])
-    t_total = np.zeros(source.shape[1])
     # X is target, P is source
     for iteration in range(max_iterations):
         nearest = find_nearest_neighbors(transformed, target)
@@ -75,39 +83,39 @@ def ICP(source, target, error_threshold, max_iterations, voxel_size):
         t_total = np.dot(t_total, r.T)+t
         transformed = np.dot(transformed, r.T) + t
         error = np.mean(np.sum((nearest-transformed) ** 2, axis=1))
-        if abs(prev_error-error) < error_threshold:
+        delta = abs(prev_error - error)
+        if delta < error_threshold:
+            print(f"  ICP converged: iter={iteration}, error={error:.8f}, delta={delta:.2e}")
             return r_total, t_total, error
         prev_error = error
+    print(f"  ICP max iterations reached: iter={max_iterations}, error={error:.8f}")
     return r_total, t_total, error
 
-def run_icp(data_file, num_scans=100, error_threshold=1e-5, max_iterations=500, voxel_size=0.5):
+def run_icp(scan_stream, num_scans=None, error_threshold=1e-5, max_iterations=100, voxel_size=0.5):
     global_pose = np.eye(4)
     pose_trajectory = []
     prev_points = None
     scans_processed = 0
-    with open(data_file, 'r') as file:
-        for line in file:
-            timestamp, points = parse_line_lidar_data(line)
-            if prev_points is None:
-                prev_points = points
-                continue
-            r, t, error = ICP(
-                prev_points,
-                points,
-                error_threshold=error_threshold,
-                max_iterations=max_iterations,
-                voxel_size=voxel_size,
-            )
-            transform = np.eye(4)
-            transform[:3, :3] = r
-            transform[:3, 3] = t
-            global_pose = np.dot(global_pose, transform)
-            pose_trajectory.append(global_pose.copy())
+    for timestamp, points in scan_stream:
+        if prev_points is None:
             prev_points = points
-            scans_processed += 1
-            if scans_processed >= num_scans:
-                break
-            print("Scan: ", scans_processed, "Error: ", error)
+            continue
+        r, t, error = ICP(
+            prev_points,
+            points,
+            error_threshold=error_threshold,
+            max_iterations=max_iterations,
+            voxel_size=voxel_size,
+        )
+        R_new = global_pose[:3, :3] @ r.T
+        global_pose[:3, :3] = R_new
+        global_pose[:3, 3] = global_pose[:3, 3] - R_new @ t
+        pose_trajectory.append(global_pose.copy())
+        prev_points = points
+        scans_processed += 1
+        if num_scans is not None and scans_processed >= num_scans:
+            break
+        print("Scan: ", scans_processed, "Error: ", error)
     return global_pose, pose_trajectory
 
 def run_dual_file_icp():
@@ -121,9 +129,9 @@ def run_dual_file_icp():
     print("r: ", r)
     print("t: ", t)
     print("error: ", error)
-    visualize_tranforation(r, t, points_a, points_b)
+    visualize_transformation(r, t, points_a, points_b)
 
-def visualize_tranforation(r, t, source, target):
+def visualize_transformation(r, t, source, target):
     transformed_source = np.dot(source, r.T) + t
     pcview.visualize_point_clouds(
         [source, transformed_source, target],
@@ -136,10 +144,4 @@ def visualize_tranforation(r, t, source, target):
         enable_toggles=True,
     )
 
-def main():
-    #global_pose, pose_trajectory = run_icp(data_file='data/lidardata.csv', num_scans=500, voxel_size=0.3)
-    run_dual_file_icp()
-    # Plot the pose trajectory
 
-if __name__ == '__main__':
-    main()

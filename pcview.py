@@ -82,6 +82,35 @@ def visualize_point_clouds(
     plotter.show()
 
 
+def visualize_trajectory(
+    poses,
+    line_color='yellow',
+    point_color='white',
+    point_size=6.0,
+    line_width=2.0,
+    background_color='black',
+    window_size=(800, 600),
+):
+    if not poses:
+        raise ValueError("poses is empty")
+
+    positions = np.array([pose[:3, 3] for pose in poses])
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError("poses must be a list of 4x4 transforms")
+
+    plotter = pv.Plotter(window_size=window_size)
+    plotter.background_color = background_color
+
+    trajectory_points = pv.PolyData(positions)
+    plotter.add_mesh(trajectory_points, color=point_color, point_size=point_size)
+
+    if len(positions) > 1:
+        polyline = pv.lines_from_points(positions)
+        plotter.add_mesh(polyline, color=line_color, line_width=line_width)
+
+    plotter.show()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Visualize point cloud data from CSV files using PyVista",
