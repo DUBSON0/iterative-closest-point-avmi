@@ -121,6 +121,10 @@ class OccupancyGrid2D:
 
         np.clip(self.log_odds, self.log_odds_min, self.log_odds_max, out=self.log_odds)
 
+    def reset(self):
+        """Zero out all log-odds (back to unexplored)."""
+        self.log_odds[:] = 0.0
+
     # ------------------------------------------------------------------
     # Probability / display
     # ------------------------------------------------------------------

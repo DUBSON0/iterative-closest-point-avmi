@@ -122,7 +122,8 @@ def voxel_downsample(points, voxel_size):
 
 
 def ICP(source, target, error_threshold, max_iterations, voxel_size,
-        R_init=None, t_init=None, method="point_to_point", normal_k=10):
+        R_init=None, t_init=None, method="point_to_point", normal_k=10,
+        max_corr_dist=None):
     """Iterative Closest Point.
 
     Parameters
@@ -133,6 +134,10 @@ def ICP(source, target, error_threshold, max_iterations, voxel_size,
         (2-D only; falls back to point-to-point for 3-D data).
     normal_k : int
         Neighbours used when estimating target normals (point-to-line only).
+    max_corr_dist : float or None
+        Maximum correspondence distance (metres).  Point pairs farther apart
+        are excluded from the alignment solve, making ICP robust to partial
+        overlap.  ``None`` disables filtering (use all correspondences).
     """
     source = voxel_downsample(source, voxel_size)
     target = voxel_downsample(target, voxel_size)
@@ -153,22 +158,33 @@ def ICP(source, target, error_threshold, max_iterations, voxel_size,
     if use_p2l:
         target_normals = estimate_normals_2d(target, k=normal_k)
 
+    max_corr_sq = max_corr_dist ** 2 if max_corr_dist is not None else None
+
     prev_error = float('inf')
     for iteration in range(max_iterations):
         # ── find correspondences ──────────────────────────────────────
         nn_indices = find_nearest_neighbor_indices(transformed, target)
         nearest = target[nn_indices]
 
-        # ── solve for incremental (r, t) ─────────────────────────────
+        # ── correspondence rejection (outlier filtering) ──────────────
+        if max_corr_sq is not None:
+            dists_sq = np.sum((transformed - nearest) ** 2, axis=1)
+            inlier = dists_sq < max_corr_sq
+            if inlier.sum() < max(3, len(transformed) // 10):
+                break   # too few inliers to compute a meaningful transform
+        else:
+            inlier = np.ones(len(transformed), dtype=bool)
+
+        # ── solve for incremental (r, t) using inliers only ──────────
         if use_p2l:
             r, t = _point_to_line_solve_2d(
-                transformed, target, target_normals, nn_indices,
+                transformed[inlier], target, target_normals, nn_indices[inlier],
             )
         else:
-            mu_source = center_of_mass(transformed)
-            mu_target = center_of_mass(nearest)
-            source_centered = transformed - mu_source
-            target_centered = nearest - mu_target
+            mu_source = center_of_mass(transformed[inlier])
+            mu_target = center_of_mass(nearest[inlier])
+            source_centered = transformed[inlier] - mu_source
+            target_centered = nearest[inlier] - mu_target
             w = np.dot(source_centered.T, target_centered)
             u, s, vt = np.linalg.svd(w)
             r = np.dot(vt.T, u.T)
@@ -177,7 +193,7 @@ def ICP(source, target, error_threshold, max_iterations, voxel_size,
                 r = np.dot(vt.T, u.T)
             t = mu_target - np.dot(r, mu_source)
 
-        # ── accumulate & apply ────────────────────────────────────────
+        # ── accumulate & apply (to ALL points) ────────────────────────
         r_total = np.dot(r, r_total)
         t_total = np.dot(t_total, r.T) + t
         transformed = np.dot(transformed, r.T) + t

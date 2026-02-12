@@ -40,6 +40,31 @@ features:
   inlier_threshold: 0.5 # RANSAC inlier distance (meters)
   min_inliers: 3        # minimum inliers to accept alignment (else fall back to identity)
 
+# --- Scan-to-submap matching (reduces drift, especially during turns) ---
+# Instead of aligning each scan to only the previous scan, we align against
+# a rolling window of recent scans projected into the global frame.
+# Uses point-to-point ICP (not point-to-line) because normals from merged
+# multi-scan data have inconsistent sign that corrupts the point-to-line solver.
+submap:
+  enabled: true           # false = fall back to scan-to-scan ICP
+  size: 30                # recent scans in the submap (more = more robust during turns)
+  voxel_size: 0.06        # downsample density for the submap (≥ icp.voxel_size)
+  max_corr_dist: 0.5      # metres — reject correspondences farther than this (tighter = cleaner solve)
+  rotation_range: 90.0    # degrees — search ± this range around predicted rotation (catches aggressive turns)
+  rotation_step: 1.0      # degrees — coarse step for rotation search (finer = more accurate)
+  rotation_fine_step: 0.2  # degrees — fine sweep step (sub-degree precision)
+  rotation_voxel_size: 0.25  # coarse voxel for rotation search scoring (speed)
+
+# --- Loop closure & pose graph optimisation ---
+loop_closure:
+  enabled: true
+  distance_threshold: 5.0       # metres — consider closure if estimated poses are this close
+  min_interval: 50              # minimum scan gap (high enough to skip same-path segment)
+  max_candidates: 3             # try up to N candidates per scan
+  error_threshold: 0.2          # max ICP error to accept a loop closure (higher than sequential!)
+  optimization_iterations: 20   # Gauss-Newton iterations
+  information_scale: 10.0       # weight multiplier for loop-closure edges vs odometry
+
 # --- Point cloud filter (z-slice before flattening to 2D) ---
 filter:
   z_min: 0.75    # meters – discard points below this height
