@@ -117,7 +117,11 @@ def _submap_rotation_search(source_local, submap_global, predicted_pose,
     After finding the best rotation, **refines the translation** with a
     single nearest-neighbour centroid step so the returned (R, t) is no
     longer locked to the predicted translation.
+
+    Uses KDTree for O(N log M) scoring per angle instead of O(N*M).
     """
+    from scipy.spatial import KDTree
+
     src = voxel_downsample(source_local, voxel_size)
     tgt = voxel_downsample(submap_global, voxel_size)
 
@@ -127,16 +131,16 @@ def _submap_rotation_search(source_local, submap_global, predicted_pose,
     pred_t = predicted_pose[:2, 2]
     pred_theta = np.arctan2(predicted_pose[1, 0], predicted_pose[0, 0])
 
-    # Pre-compute for fast NN scoring
-    tgt_sq = np.sum(tgt ** 2, axis=1, keepdims=True)          # (M, 1)
+    # Build KDTree on target ONCE — each angle evaluation is now
+    # O(N log M) instead of O(N*M).
+    tgt_tree = KDTree(tgt)
 
     def _score(theta):
         ca, sa = np.cos(theta), np.sin(theta)
         R = np.array([[ca, -sa], [sa, ca]])
         rotated = src @ R.T + pred_t                           # (N, 2)
-        rot_sq = np.sum(rotated ** 2, axis=1, keepdims=True)   # (N, 1)
-        D = np.maximum(rot_sq + tgt_sq.T - 2.0 * rotated @ tgt.T, 0.0)
-        return np.mean(np.min(D, axis=1))
+        dists, _ = tgt_tree.query(rotated)
+        return np.mean(dists ** 2)
 
     # ── coarse sweep ──────────────────────────────────────────────────
     offsets = np.deg2rad(np.arange(-angle_range, angle_range + angle_step,
@@ -162,18 +166,13 @@ def _submap_rotation_search(source_local, submap_global, predicted_pose,
     R_best = np.array([[ca, -sa], [sa, ca]])
 
     # ── refine translation with one NN centroid step ──────────────────
-    # Without this the translation is exactly the predicted one, which
-    # is wrong whenever the constant-velocity model mispredicts
-    # (e.g. reversal, stop, sudden acceleration).
     rotated_src = src @ R_best.T
     placed = rotated_src + pred_t
-    placed_sq = np.sum(placed ** 2, axis=1, keepdims=True)
-    D_nn = np.maximum(placed_sq + tgt_sq.T - 2.0 * placed @ tgt.T, 0.0)
-    nn_idx = np.argmin(D_nn, axis=1)
-    nn_dists = D_nn[np.arange(len(nn_idx)), nn_idx]
+    nn_dists, nn_idx = tgt_tree.query(placed)
+    nn_dists_sq = nn_dists ** 2
     # Keep the closest 80 % to suppress outlier correspondences
-    dist_thresh = np.percentile(nn_dists, 80)
-    inlier_mask = nn_dists <= dist_thresh
+    dist_thresh = np.percentile(nn_dists_sq, 80)
+    inlier_mask = nn_dists_sq <= dist_thresh
     if inlier_mask.sum() >= 5:
         matched = tgt[nn_idx]
         refined_t = np.mean(matched[inlier_mask] - rotated_src[inlier_mask],
@@ -229,17 +228,42 @@ def _attempt_submap_icp(source, submap, predicted,
 # ── Loop-closure helpers ─────────────────────────────────────────────────────
 
 def _find_loop_candidates(current_pose, scan_history, current_idx,
-                          distance_threshold, min_interval, max_candidates):
+                          distance_threshold, min_interval, max_candidates,
+                          min_cumulative_travel=10.0):
     """Return indices of historical scans that are spatially close but
-    temporally far from the current scan — i.e. loop-closure candidates."""
+    temporally far from the current scan — i.e. loop-closure candidates.
+
+    An extra *min_cumulative_travel* gate ensures the vehicle has actually
+    **left the area and come back** rather than just sitting still for
+    ``min_interval`` scans (which would produce false loop closures that
+    pin the trajectory to the origin).
+    """
     curr_pos = current_pose[:2, 2]
+
+    # Pre-compute cumulative odometric distance along the trajectory so we
+    # can cheaply look up "how far did we drive between scan i and now?".
+    # cum_dist[k] = cumulative path length from scan 0 to scan k.
+    n = len(scan_history)
+    cum_dist = np.zeros(n, dtype=np.float64)
+    for k in range(1, n):
+        cum_dist[k] = cum_dist[k - 1] + np.linalg.norm(
+            scan_history[k][1][:2, 2] - scan_history[k - 1][1][:2, 2]
+        )
+
     candidates = []
     for idx, (_, pose) in enumerate(scan_history):
         if current_idx - idx < min_interval:
             continue
+        # Euclidean distance (current → candidate) must be small
         dist = np.linalg.norm(curr_pos - pose[:2, 2])
-        if dist < distance_threshold:
-            candidates.append((idx, dist))
+        if dist >= distance_threshold:
+            continue
+        # Cumulative travel between candidate and current scan must be
+        # large — otherwise the robot never actually left this area.
+        travel = cum_dist[current_idx] - cum_dist[idx] if current_idx < n else 0.0
+        if travel < min_cumulative_travel:
+            continue
+        candidates.append((idx, dist))
     candidates.sort(key=lambda x: x[1])
     return candidates[:max_candidates]
 
@@ -290,7 +314,8 @@ def run_slam(cfg):
     sleep_s = svc_cfg.get("sleep_s", 0.0)
     loop    = svc_cfg.get("loop", True)
 
-    num_scans  = cfg.get("num_scans", None)
+    num_scans       = cfg.get("num_scans", None)
+    process_every_n = cfg.get("process_every_n", 1)
     live_map   = disp_cfg.get("live_map", True)
     win_w      = disp_cfg.get("window_width", 1400)
     win_h      = disp_cfg.get("window_height", 1000)
@@ -310,6 +335,7 @@ def run_slam(cfg):
     lc_error_thresh  = lc_cfg.get("error_threshold", 0.03)
     lc_opt_iters     = lc_cfg.get("optimization_iterations", 20)
     lc_info_scale    = lc_cfg.get("information_scale", 10.0)
+    lc_min_travel    = lc_cfg.get("min_cumulative_travel", 20.0)
 
     data_file = cfg.get("data_file", "data/ugvlidar-full.csv")
 
@@ -319,6 +345,7 @@ def run_slam(cfg):
     imu_file    = imu_cfg.get("file", "")
     imu_narrow  = imu_cfg.get("narrow_search_range", 5.0)   # degrees around IMU yaw
     imu = None
+    imu_yaw_offset = 0.0          # calibrate IMU yaw to global frame
     if imu_enabled and imu_file:
         imu = IMUService(imu_file)
 
@@ -335,6 +362,8 @@ def run_slam(cfg):
     last_delta = None             # incremental pose for motion prediction
     prev_rel_time = None          # for IMU delta yaw
 
+    scan_counter = 0              # raw scan counter (for process_every_n)
+
     # Pose graph
     pose_graph = PoseGraph2D()
 
@@ -346,6 +375,11 @@ def run_slam(cfg):
 
     try:
         for timestamp, rel_time_us, raw_points in scan_stream:
+            # ── scan skip (process every Nth) ─────────────────────────
+            scan_counter += 1
+            if process_every_n > 1 and (scan_counter % process_every_n) != 1:
+                continue
+
             points = filter_and_flatten(raw_points, z_min=z_min, z_max=z_max)
             if points.shape[0] < 10:
                 continue
@@ -354,6 +388,13 @@ def run_slam(cfg):
             if prev_points is None:
                 prev_points = points
                 prev_rel_time = rel_time_us
+
+                # Calibrate: record IMU yaw at the first scan so the
+                # global frame starts at yaw = 0.
+                if imu is not None:
+                    imu_yaw_offset = imu.yaw_at(rel_time_us)
+                    print(f"  [IMU] Calibrated initial yaw offset: "
+                          f"{np.degrees(imu_yaw_offset):.1f}°")
                 min_x, max_x, min_y, max_y = compute_bounds_from_scan(points, margin=map_margin)
                 mapper = OccupancyGrid2D(
                     min_x=min_x, max_x=max_x,
@@ -415,121 +456,86 @@ def run_slam(cfg):
             imu_yaw = None
             imu_delta = None
             if imu is not None:
-                imu_yaw = imu.yaw_at(rel_time_us)
+                # Calibrated absolute yaw: 0 at first scan, relative after
+                raw_yaw = imu.yaw_at(rel_time_us)
+                imu_yaw = (raw_yaw - imu_yaw_offset + np.pi) % (2 * np.pi) - np.pi
                 if prev_rel_time is not None:
                     imu_delta = imu.delta_yaw(prev_rel_time, rel_time_us)
 
-            # ── ICP alignment ─────────────────────────────────────────
-            icp_ok = False
+            # ── Step 1: Scan-to-scan ICP (primary odometry) ───────────
+            # This always runs first and gives the real incremental motion.
+            if imu_delta is not None:
+                ca, sa = np.cos(imu_delta), np.sin(imu_delta)
+                R_imu = np.array([[ca, -sa], [sa, ca]])
+                t_imu = np.zeros(2)
+                r_inc, t_inc, err_inc = ICP(
+                    prev_points, points,
+                    error_threshold=icp_cfg.get("error_threshold", 1e-7),
+                    max_iterations=icp_cfg.get("max_iterations", 100),
+                    voxel_size=icp_cfg.get("voxel_size", 0.06),
+                    R_init=R_imu, t_init=t_imu,
+                    method=icp_cfg.get("method", "point_to_line"),
+                    normal_k=icp_cfg.get("normal_k", 10),
+                )
+            else:
+                r_inc, t_inc, err_inc = _run_icp_pair(
+                    prev_points, points, icp_cfg, feat_cfg, alignment_method,
+                )
 
+            if err_inc > error_reject_threshold:
+                print(f"Scan {scans_processed}: S2S error {err_inc:.6f} too high, skipping")
+                prev_points = points
+                prev_rel_time = rel_time_us
+                scans_processed += 1
+                continue
+
+            # Accumulate incremental motion into global pose
+            prev_global = global_pose.copy()
+            global_pose = apply_incremental_pose_2d(global_pose, r_inc, t_inc)
+            error = err_inc
+
+            # ── Step 2: Submap drift correction (optional) ──────────
+            # The submap ICP provides an absolute global pose.  We only
+            # apply it if its answer is *close* to the incrementally
+            # accumulated pose — preventing the submap from "resetting"
+            # the pose back to the origin.
             if submap_enabled and len(submap_buffer) > 0:
-                # --- Strategy 1: scan-to-submap (multi-hypothesis) ---
                 submap = _build_submap(submap_buffer, submap_voxel)
 
-                # ── Attempt 1: constant-velocity prediction ───────────
-                if last_delta is not None:
-                    predicted = global_pose @ last_delta
-                else:
-                    predicted = global_pose.copy()
-
-                r, t, error = _attempt_submap_icp(
-                    points, submap, predicted,
+                r_sub, t_sub, err_sub = _attempt_submap_icp(
+                    points, submap, global_pose.copy(),
                     imu_yaw, imu_narrow,
                     sub_rot_range, sub_rot_step, sub_rot_fine,
                     sub_rot_voxel, icp_cfg, sub_corr_dist,
                 )
 
-                # ── Attempt 2: zero-velocity (handles reversal/stop) ─
-                if error > error_reject_threshold and last_delta is not None:
-                    print(f"  Motion-predicted ICP error {error:.4f} — "
-                          f"retrying with zero-velocity …")
-                    r2, t2, err2 = _attempt_submap_icp(
-                        points, submap, global_pose.copy(),
-                        imu_yaw, imu_narrow,
-                        sub_rot_range, sub_rot_step, sub_rot_fine,
-                        sub_rot_voxel, icp_cfg, sub_corr_dist,
-                    )
-                    if err2 < error:
-                        r, t, error = r2, t2, err2
-                        print(f"  Zero-velocity retry → error {error:.4f}")
+                if err_sub <= error_reject_threshold:
+                    # Build submap-based absolute pose
+                    submap_pose = np.eye(3)
+                    submap_pose[:2, :2] = r_sub
+                    submap_pose[:2, 2]  = t_sub
 
-                # ── IMU yaw consistency guard ─────────────────────────
-                # If ICP converged but introduced a rotation the IMU
-                # disagrees with, clamp to the IMU yaw and re-derive
-                # the translation via a single NN centroid step.
-                if error <= error_reject_threshold and imu_yaw is not None:
-                    icp_yaw = np.arctan2(r[1, 0], r[0, 0])
-                    yaw_diff = (icp_yaw - imu_yaw + np.pi) % (2 * np.pi) - np.pi
-                    if abs(yaw_diff) > np.deg2rad(15.0):
-                        print(f"  ICP yaw {np.degrees(icp_yaw):.1f}° vs "
-                              f"IMU {np.degrees(imu_yaw):.1f}° "
-                              f"(Δ {np.degrees(yaw_diff):+.1f}°) — "
-                              f"clamping to IMU")
-                        ca, sa = np.cos(imu_yaw), np.sin(imu_yaw)
-                        r = np.array([[ca, -sa], [sa, ca]])
-                        # Re-derive translation with corrected rotation
-                        ds = voxel_downsample(
-                            points, icp_cfg.get("voxel_size", 0.06))
-                        rotated = ds @ r.T
-                        placed = rotated + t          # ICP's t as seed
-                        ds_sub = voxel_downsample(
-                            submap, icp_cfg.get("voxel_size", 0.06))
-                        dists_sq = np.sum(
-                            (placed[:, None, :] - ds_sub[None, :, :]) ** 2,
-                            axis=2,
-                        )
-                        nn_idx = np.argmin(dists_sq, axis=1)
-                        nn_d = dists_sq[np.arange(len(nn_idx)), nn_idx]
-                        keep = nn_d <= np.percentile(nn_d, 80)
-                        if keep.sum() >= 5:
-                            matched = ds_sub[nn_idx]
-                            t = np.mean(
-                                matched[keep] - rotated[keep], axis=0)
+                    # Only apply the correction if the submap agrees
+                    # roughly with the incrementally accumulated pose.
+                    pos_diff = np.linalg.norm(
+                        submap_pose[:2, 2] - global_pose[:2, 2])
+                    sub_yaw = np.arctan2(r_sub[1, 0], r_sub[0, 0])
+                    inc_yaw = np.arctan2(
+                        global_pose[1, 0], global_pose[0, 0])
+                    yaw_diff = abs(
+                        (sub_yaw - inc_yaw + np.pi) % (2 * np.pi) - np.pi)
 
-                if error <= error_reject_threshold:
-                    prev_global = global_pose.copy()
-                    # ICP result directly gives global pose:
-                    #   local @ r.T + t ≈ submap_global
-                    global_pose = np.eye(3)
-                    global_pose[:2, :2] = r
-                    global_pose[:2, 2]  = t
-                    last_delta = np.linalg.inv(prev_global) @ global_pose
-                    icp_ok = True
-                else:
-                    print(f"  Submap ICP error {error:.4f} too high — "
-                          f"falling back to scan-to-scan")
+                    max_pos_corr = sub_corr_dist   # metres
+                    max_yaw_corr = np.deg2rad(15.0)
 
-            if not icp_ok:
-                # --- Strategy 2 / fallback: scan-to-scan ---
-                if imu_delta is not None:
-                    # Use IMU delta yaw as initial rotation guess
-                    ca, sa = np.cos(imu_delta), np.sin(imu_delta)
-                    R_imu = np.array([[ca, -sa], [sa, ca]])
-                    t_imu = np.zeros(2)
-                    r, t, error = ICP(
-                        prev_points, points,
-                        error_threshold=icp_cfg.get("error_threshold", 1e-7),
-                        max_iterations=icp_cfg.get("max_iterations", 100),
-                        voxel_size=icp_cfg.get("voxel_size", 0.06),
-                        R_init=R_imu, t_init=t_imu,
-                        method=icp_cfg.get("method", "point_to_line"),
-                        normal_k=icp_cfg.get("normal_k", 10),
-                    )
-                else:
-                    # No IMU — full rotation search
-                    r, t, error = _run_icp_pair(
-                        prev_points, points, icp_cfg, feat_cfg, alignment_method,
-                    )
-                if error > error_reject_threshold:
-                    print(f"Scan {scans_processed}: error {error:.6f} too high, skipping")
-                    prev_points = points
-                    prev_rel_time = rel_time_us
-                    scans_processed += 1
-                    continue
-                global_pose = apply_incremental_pose_2d(global_pose, r, t)
-                # Reset motion prediction after fallback
-                last_delta = None
-                icp_ok = True
+                    if pos_diff < max_pos_corr and yaw_diff < max_yaw_corr:
+                        global_pose = submap_pose
+                        error = err_sub
+                        print(f"  Submap correction applied "
+                              f"(Δpos={pos_diff:.3f}m, "
+                              f"Δyaw={np.degrees(yaw_diff):.1f}°)")
+
+            last_delta = np.linalg.inv(prev_global) @ global_pose
 
             pose_trajectory.append(global_pose.copy())
 
@@ -561,6 +567,7 @@ def run_slam(cfg):
                 candidates = _find_loop_candidates(
                     global_pose, scan_history, cur_idx,
                     lc_distance, lc_min_interval, lc_max_cand,
+                    min_cumulative_travel=lc_min_travel,
                 )
                 if candidates:
                     print(f"  LC candidates for scan {cur_idx}: "
@@ -634,9 +641,12 @@ def run_slam(cfg):
             prev_points = points
             prev_rel_time = rel_time_us
             scans_processed += 1
+            pos = global_pose[:2, 2]
+            yaw_deg = np.degrees(np.arctan2(global_pose[1, 0], global_pose[0, 0]))
+            print(f"Scan {scans_processed:4d}  err={error:.6f}  "
+                  f"pos=({pos[0]:+.3f}, {pos[1]:+.3f})  yaw={yaw_deg:+.2f}°")
             if num_scans is not None and scans_processed >= num_scans:
                 break
-            print("Scan: ", scans_processed, "Error: ", error)
 
     except KeyboardInterrupt:
         print("Stopping SLAM loop...")

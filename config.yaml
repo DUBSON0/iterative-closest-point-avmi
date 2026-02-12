@@ -3,7 +3,16 @@
 # ============================================================
 
 # --- Data source ---
-data_file: "data/ugvlidar-full.csv"
+data_file: "data/data_recording_20251007_163713_lidar_reader__Decoded_VLP_to_PointCloud_1_1_XYZ_points.csv"
+
+# --- IMU orientation (quaternion) ---
+# When enabled the gyro-derived absolute yaw replaces the expensive rotation
+# search, making turns virtually bulletproof.  The file must be semicolon-
+# delimited with columns: timestamp_us ; qx ; qy ; qz ; qw
+imu:
+  enabled: true
+  file: "data/data_recording_20251007_163713_vn_300_ros2_mc_1__imu_sub_orientation_quaternion.csv"
+  narrow_search_range: 5.0   # degrees — tiny refinement search around IMU yaw
 
 # --- ICP parameters ---
 # method: "point_to_line" (recommended for 2D) or "point_to_point" (classic)
@@ -13,7 +22,7 @@ icp:
   voxel_size: 0.06
   error_threshold: 1.0e-10
   max_iterations: 100
-  error_reject_threshold: 0.05  # skip scan if ICP error > this value
+  error_reject_threshold: 0.25  # skip scan if ICP error > this value
 
 # --- Pre-alignment (handles large inter-scan rotations) ---
 # method: "rotation_search" | "features" | "both" | "none"
@@ -25,12 +34,12 @@ features:
   method: "rotation_search"
 
   # ─ correlative rotation search ─
-  rotation_voxel_size: 0.3   # coarse voxel for the angle sweep (meters)
+  rotation_voxel_size: 0.2   # coarse voxel for the angle sweep (meters)
   angle_step_coarse: 2.0      # degrees per step in the full [-180°,180°) sweep
   angle_step_fine: 0.2        # degrees per step in the refinement band
 
   # ─ feature-based alignment (used when method is "features" or "both") ─
-  voxel_size: 0.3       # coarse downsample for feature extraction (meters)
+  voxel_size: 0.2       # coarse downsample for feature extraction (meters)
   k_curvature: 10       # neighbours used for curvature estimation
   top_n: 100            # max keypoints per scan
   min_kp_dist: 0.3      # non-max suppression radius (meters)
@@ -49,7 +58,7 @@ submap:
   enabled: true           # false = fall back to scan-to-scan ICP
   size: 30                # recent scans in the submap (more = more robust during turns)
   voxel_size: 0.06        # downsample density for the submap (≥ icp.voxel_size)
-  max_corr_dist: 0.5      # metres — reject correspondences farther than this (tighter = cleaner solve)
+  max_corr_dist: 2.0      # metres — reject correspondences farther than this (needs slack for submap drift)
   rotation_range: 90.0    # degrees — search ± this range around predicted rotation (catches aggressive turns)
   rotation_step: 1.0      # degrees — coarse step for rotation search (finer = more accurate)
   rotation_fine_step: 0.2  # degrees — fine sweep step (sub-degree precision)
@@ -58,17 +67,20 @@ submap:
 # --- Loop closure & pose graph optimisation ---
 loop_closure:
   enabled: true
-  distance_threshold: 5.0       # metres — consider closure if estimated poses are this close
-  min_interval: 50              # minimum scan gap (high enough to skip same-path segment)
+  distance_threshold: 0.5       # metres — consider closure if estimated poses are this close
+  min_interval: 50             # minimum scan gap (high enough to skip same-path segment)
+  min_cumulative_travel: 2.0   # metres — vehicle must have driven at least this far along the
+                                # trajectory since the candidate scan (prevents false closures
+                                # when the robot is still near the start and hasn't left yet)
   max_candidates: 3             # try up to N candidates per scan
   error_threshold: 0.2          # max ICP error to accept a loop closure (higher than sequential!)
   optimization_iterations: 20   # Gauss-Newton iterations
-  information_scale: 10.0       # weight multiplier for loop-closure edges vs odometry
+  information_scale: 1.0        # weight multiplier for loop-closure edges vs odometry
 
 # --- Point cloud filter (z-slice before flattening to 2D) ---
 filter:
-  z_min: 0.75    # meters – discard points below this height
-  z_max: 1.0    # meters – discard points above this height
+  z_min: 0.0    # meters – discard points below this height
+  z_max: 2.0    # meters – discard points above this height
 
 # --- Occupancy grid / mapping ---
 mapping:
@@ -86,6 +98,7 @@ service:
 
 # --- Run control ---
 num_scans: null        # null = unlimited, or set an integer to limit
+process_every_n: 1     # process every Nth scan (2 = skip every other, 3 = every third, etc.)
 
 # --- Live map display ---
 display:
