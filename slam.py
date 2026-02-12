@@ -332,6 +332,7 @@ def run_slam(cfg):
     p_miss         = map_cfg.get("p_miss", 0.4)
     log_odds_min   = map_cfg.get("log_odds_min", -5.0)
     log_odds_max   = map_cfg.get("log_odds_max", 5.0)
+    elevation_scale = map_cfg.get("elevation_scale", 1.0)
 
     sleep_s = svc_cfg.get("sleep_s", 0.0)
     loop    = svc_cfg.get("loop", True)
@@ -377,6 +378,7 @@ def run_slam(cfg):
     global_pose = np.eye(3)
     pose_trajectory = []          # list of 3×3 matrices (for display)
     scan_history = []             # list of (points_2d, pose_3x3)
+    scan_history_3d = []          # parallel list of 3D points (for 2.5-D mapping)
     prev_points = None
     mapper = None
     scans_processed = 0
@@ -402,7 +404,7 @@ def run_slam(cfg):
             if process_every_n > 1 and (scan_counter % process_every_n) != 1:
                 continue
 
-            points = filter_and_flatten(raw_points, z_min=z_min, z_max=z_max)
+            points, points_3d = filter_points(raw_points, z_min=z_min, z_max=z_max)
             if points.shape[0] < 10:
                 continue
 
@@ -424,15 +426,18 @@ def run_slam(cfg):
                     resolution=map_resolution,
                     p_hit=p_hit, p_miss=p_miss,
                     log_odds_min=log_odds_min, log_odds_max=log_odds_max,
+                    elevation_scale=elevation_scale,
                 )
                 sensor_origin = global_pose[:2, 2]
                 global_points = transform_points_2d(points, global_pose)
-                mapper.update_scan(sensor_origin, global_points)
+                global_points_3d = transform_points_25d(points_3d, global_pose)
+                mapper.update_scan(sensor_origin, global_points_3d)
 
                 if submap_enabled:
                     submap_buffer.append(global_points.copy())
 
                 scan_history.append((points.copy(), global_pose.copy()))
+                scan_history_3d.append(points_3d.copy())
                 pose_graph.add_node(pose_matrix_to_vec(global_pose))
 
                 if live_map:
