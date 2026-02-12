@@ -21,8 +21,18 @@ def load_config(path="config.yaml"):
         return yaml.safe_load(f)
 
 
-def filter_points(points, z_min=0.2, z_max=2.0):
-    """Keep only points with z in [z_min, z_max].
+def filter_points(points, z_min=0.2, z_max=2.0, max_range=None):
+    """Keep points with z in [z_min, z_max] and within *max_range* of the sensor.
+
+    Parameters
+    ----------
+    points : ndarray, shape (N, 3+)
+        Raw point cloud in the sensor frame.
+    z_min, z_max : float
+        Height band filter (sensor frame).
+    max_range : float or None
+        If set, discard points whose horizontal (xy) distance from the
+        sensor exceeds this value.  Eliminates far-flung noisy returns.
 
     Returns
     -------
@@ -32,6 +42,9 @@ def filter_points(points, z_min=0.2, z_max=2.0):
         Filtered points with original z preserved (for 2.5-D mapping).
     """
     mask = (points[:, 2] >= z_min) & (points[:, 2] <= z_max)
+    if max_range is not None:
+        r_xy = np.sqrt(points[:, 0] ** 2 + points[:, 1] ** 2)
+        mask &= r_xy <= max_range
     pts_3d = points[mask].copy()
     pts_2d = pts_3d[:, :2].copy()
     return pts_2d, pts_3d
@@ -154,18 +167,23 @@ def _submap_rotation_search(source_local, submap_global, predicted_pose,
     # O(N log M) instead of O(N*M).
     tgt_tree = KDTree(tgt)
 
-    def _score(theta):
-        ca, sa = np.cos(theta), np.sin(theta)
-        R = np.array([[ca, -sa], [sa, ca]])
-        rotated = src @ R.T + pred_t                           # (N, 2)
-        dists, _ = tgt_tree.query(rotated)
-        return np.mean(dists ** 2)
+    def _batch_scores(angles):
+        """Score all rotation angles in one bulk KDTree query."""
+        ca = np.cos(angles)[:, None]              # (A, 1)
+        sa = np.sin(angles)[:, None]
+        x = src[:, 0][None, :]                    # (1, N)
+        y = src[:, 1][None, :]
+        rx = ca * x - sa * y + pred_t[0]          # (A, N)
+        ry = sa * x + ca * y + pred_t[1]
+        pts = np.column_stack([rx.ravel(), ry.ravel()])
+        dists, _ = tgt_tree.query(pts, workers=-1)
+        return np.mean(dists.reshape(len(angles), -1) ** 2, axis=1)
 
     # ── coarse sweep ──────────────────────────────────────────────────
     offsets = np.deg2rad(np.arange(-angle_range, angle_range + angle_step,
                                     angle_step))
     angles = pred_theta + offsets
-    scores = np.array([_score(a) for a in angles])
+    scores = _batch_scores(angles)
     best_idx = int(np.argmin(scores))
     best_angle = angles[best_idx]
 
@@ -174,7 +192,7 @@ def _submap_rotation_search(source_local, submap_global, predicted_pose,
     fine_hi = best_angle + np.deg2rad(angle_step)
     fine_angles = np.arange(fine_lo, fine_hi, np.deg2rad(fine_step))
     if len(fine_angles) > 0:
-        fine_scores = np.array([_score(a) for a in fine_angles])
+        fine_scores = _batch_scores(fine_angles)
         best_angle = fine_angles[int(np.argmin(fine_scores))]
 
     correction = np.degrees(best_angle - pred_theta)
@@ -287,16 +305,21 @@ def _find_loop_candidates(current_pose, scan_history, current_idx,
     return candidates[:max_candidates]
 
 
-def _rebuild_map(mapper, scan_history, scan_history_3d=None):
+def _rebuild_map(mapper, scan_history, scan_history_3d=None,
+                 obstacle_z_min=0.3, obstacle_z_max=3.0):
     """Clear the occupancy grid and replay every scan with its current pose."""
     mapper.reset()
     for k, (pts_2d, pose) in enumerate(scan_history):
         origin = pose[:2, 2]
         if scan_history_3d is not None:
-            global_pts = transform_points_25d(scan_history_3d[k], pose)
+            pts_3d_local = scan_history_3d[k]
+            global_pts = transform_points_25d(pts_3d_local, pose)
+            obs_mask = ((pts_3d_local[:, 2] >= obstacle_z_min)
+                        & (pts_3d_local[:, 2] <= obstacle_z_max))
+            mapper.update_scan(origin, global_pts, obstacle_mask=obs_mask)
         else:
             global_pts = transform_points_2d(pts_2d, pose)
-        mapper.update_scan(origin, global_pts)
+            mapper.update_scan(origin, global_pts)
 
 
 # ── main SLAM loop ───────────────────────────────────────────────────────────
@@ -315,6 +338,7 @@ def run_slam(cfg):
     alignment_method = feat_cfg.get("method", "rotation_search")
 
     submap_enabled  = sub_cfg.get("enabled", True)
+    submap_every_n  = max(1, int(sub_cfg.get("every_n", 3)))
     submap_size     = sub_cfg.get("size", 30)
     submap_voxel    = sub_cfg.get("voxel_size", 0.06)
     sub_rot_range   = sub_cfg.get("rotation_range", 90.0)
@@ -325,6 +349,9 @@ def run_slam(cfg):
 
     z_min = filt_cfg.get("z_min", 0.2)
     z_max = filt_cfg.get("z_max", 2.0)
+    max_range = filt_cfg.get("max_range", None)
+    obstacle_z_min = filt_cfg.get("obstacle_z_min", 0.3)
+    obstacle_z_max = filt_cfg.get("obstacle_z_max", 3.0)
 
     map_resolution = map_cfg.get("resolution", 0.1)
     map_margin     = map_cfg.get("margin", 50.0)
@@ -342,9 +369,11 @@ def run_slam(cfg):
     live_map   = disp_cfg.get("live_map", True)
     win_w      = disp_cfg.get("window_width", 1400)
     win_h      = disp_cfg.get("window_height", 1000)
-    cmap       = disp_cfg.get("cmap", "gray")
-    clim_min   = disp_cfg.get("clim_min", 0.0)
-    clim_max   = disp_cfg.get("clim_max", 1.0)
+    color_by   = disp_cfg.get("color_by", "elevation")
+    cmap       = disp_cfg.get("cmap", "terrain")
+    clim_min   = disp_cfg.get("clim_min", None)
+    clim_max   = disp_cfg.get("clim_max", None)
+    nan_color  = disp_cfg.get("nan_color", "gray")
     bg_color   = disp_cfg.get("background", "black")
     traj_color = disp_cfg.get("trajectory_color", "cyan")
     pose_color = disp_cfg.get("pose_color", "lime")
@@ -404,7 +433,8 @@ def run_slam(cfg):
             if process_every_n > 1 and (scan_counter % process_every_n) != 1:
                 continue
 
-            points, points_3d = filter_points(raw_points, z_min=z_min, z_max=z_max)
+            points, points_3d = filter_points(raw_points, z_min=z_min, z_max=z_max,
+                                                max_range=max_range)
             if points.shape[0] < 10:
                 continue
 
@@ -431,7 +461,10 @@ def run_slam(cfg):
                 sensor_origin = global_pose[:2, 2]
                 global_points = transform_points_2d(points, global_pose)
                 global_points_3d = transform_points_25d(points_3d, global_pose)
-                mapper.update_scan(sensor_origin, global_points_3d)
+                obs_mask = ((points_3d[:, 2] >= obstacle_z_min)
+                            & (points_3d[:, 2] <= obstacle_z_max))
+                mapper.update_scan(sensor_origin, global_points_3d,
+                                   obstacle_mask=obs_mask)
 
                 if submap_enabled:
                     submap_buffer.append(global_points.copy())
@@ -444,13 +477,15 @@ def run_slam(cfg):
                     map_fig = pv.Plotter(window_size=(win_w, win_h))
                     map_grid = mapper.create_pyvista_grid()
                     map_fig.set_background(bg_color)
-                    map_fig.add_mesh(
-                        map_grid,
-                        scalars="occ",
-                        clim=(clim_min, clim_max),
+                    mesh_kw = dict(
+                        scalars=color_by,
                         cmap=cmap,
-                        show_scalar_bar=False,
+                        nan_color=nan_color,
+                        show_scalar_bar=(color_by == "elevation"),
                     )
+                    if clim_min is not None and clim_max is not None:
+                        mesh_kw["clim"] = (clim_min, clim_max)
+                    map_fig.add_mesh(map_grid, **mesh_kw)
                     init_pt = np.array([[global_pose[0, 2], global_pose[1, 2], 0.0]])
                     traj_mesh = pv.PolyData(init_pt)
                     traj_mesh.lines = np.array([1, 0])
@@ -466,15 +501,187 @@ def run_slam(cfg):
                     map_fig.reset_camera()
                     map_fig.enable_parallel_projection()
 
+                    # ── view / zoom state shared by callbacks ──────────
+                    # Mutable dict so nested closures can read & write.
+                    _ui = {
+                        "mode": "overhead",       # "overhead" | "angled"
+                        "scale": None,            # saved parallel_scale
+                        "btn_overhead": None,     # VTK widget ref
+                        "btn_angled": None,       # VTK widget ref
+                        "btn_zoom_in": None,      # VTK widget ref
+                        "btn_zoom_out": None,     # VTK widget ref
+                    }
+
+                    def _set_btn(widget, on):
+                        """Programmatically set a checkbox-button widget state."""
+                        if widget is None:
+                            return
+                        rep = widget.GetRepresentation()
+                        rep.SetState(bool(on))
+
+                    def _apply_overhead():
+                        """Switch to top-down parallel projection."""
+                        cam = map_fig.camera
+                        # Preserve zoom level across view switches
+                        if _ui["scale"] is not None:
+                            saved = _ui["scale"]
+                        else:
+                            saved = cam.parallel_scale
+                        map_fig.view_xy()
+                        map_fig.enable_parallel_projection()
+                        cam.parallel_scale = max(saved, 1.0)
+                        map_fig.render()
+
+                    def _apply_angled():
+                        """Switch to 45° perspective view."""
+                        cam = map_fig.camera
+                        # Save current zoom so we can restore it later
+                        _ui["scale"] = cam.parallel_scale
+                        fp = np.array(cam.focal_point)
+                        dist = max(cam.parallel_scale, 1.0) * 2.0
+                        # 45° elevation, looking from south-east
+                        elev = np.deg2rad(45.0)
+                        azim = np.deg2rad(135.0)
+                        cam.position = (
+                            fp[0] + dist * np.cos(elev) * np.cos(azim),
+                            fp[1] + dist * np.cos(elev) * np.sin(azim),
+                            fp[2] + dist * np.sin(elev),
+                        )
+                        cam.focal_point = tuple(fp)
+                        cam.up = (0.0, 0.0, 1.0)
+                        cam.view_angle = 30.0
+                        map_fig.disable_parallel_projection()
+                        map_fig.render()
+
+                    # ── view-mode radio callbacks ──────────────────────
+                    def _on_overhead(state):
+                        # Always activate overhead; force the radio pair
+                        _ui["mode"] = "overhead"
+                        _set_btn(_ui["btn_overhead"], True)
+                        _set_btn(_ui["btn_angled"], False)
+                        _apply_overhead()
+
+                    def _on_angled(state):
+                        # Always activate angled; force the radio pair
+                        _ui["mode"] = "angled"
+                        _set_btn(_ui["btn_angled"], True)
+                        _set_btn(_ui["btn_overhead"], False)
+                        _apply_angled()
+
+                    # ── zoom helpers ───────────────────────────────────
+                    def _zoom_toward_pose(factor):
+                        """Zoom camera toward / away from the current pose."""
+                        px, py = global_pose[0, 2], global_pose[1, 2]
+                        cam = map_fig.camera
+                        cam.focal_point = (px, py, 0.0)
+                        if cam.parallel_projection:
+                            cam.parallel_scale = max(
+                                cam.parallel_scale * factor, 0.5)
+                            _ui["scale"] = cam.parallel_scale
+                        else:
+                            pos = np.array(cam.position)
+                            fp = np.array(cam.focal_point)
+                            direction = pos - fp
+                            new_dist = np.linalg.norm(direction) * factor
+                            if new_dist < 0.5:
+                                new_dist = 0.5
+                            cam.position = tuple(
+                                fp + direction / np.linalg.norm(direction)
+                                * new_dist)
+                            _ui["scale"] = new_dist / 2.0
+                        map_fig.render()
+
+                    # Zoom button callbacks — act as momentary push
+                    # buttons: trigger the zoom then immediately reset
+                    # the widget back to the "off" visual state.
+                    def _on_zoom_in(state):
+                        _zoom_toward_pose(0.8)
+                        _set_btn(_ui["btn_zoom_in"], False)
+
+                    def _on_zoom_out(state):
+                        _zoom_toward_pose(1.25)
+                        _set_btn(_ui["btn_zoom_out"], False)
+
+                    # ── keyboard shortcuts ─────────────────────────────
                     def zoom_in():
-                        map_fig.camera.parallel_scale *= 0.9
-                        map_fig.render()
+                        _zoom_toward_pose(0.9)
                     def zoom_out():
-                        map_fig.camera.parallel_scale *= 1.1
-                        map_fig.render()
+                        _zoom_toward_pose(1.1)
                     map_fig.add_key_event("plus", zoom_in)
                     map_fig.add_key_event("equal", zoom_in)
                     map_fig.add_key_event("minus", zoom_out)
+
+                    # ── button widgets ─────────────────────────────────
+                    btn_size = 30
+                    btn_x = 10
+
+                    _ui["btn_overhead"] = map_fig.add_checkbox_button_widget(
+                        _on_overhead,
+                        value=True,
+                        position=(btn_x, 10),
+                        size=btn_size,
+                        border_size=2,
+                        color_on="dodgerblue",
+                        color_off="gray",
+                    )
+                    map_fig.add_text(
+                        "Overhead",
+                        position=(btn_x + btn_size + 6, 12),
+                        font_size=9,
+                        color="white",
+                        name="lbl_overhead",
+                    )
+
+                    _ui["btn_angled"] = map_fig.add_checkbox_button_widget(
+                        _on_angled,
+                        value=False,
+                        position=(btn_x, 50),
+                        size=btn_size,
+                        border_size=2,
+                        color_on="dodgerblue",
+                        color_off="gray",
+                    )
+                    map_fig.add_text(
+                        "Angled",
+                        position=(btn_x + btn_size + 6, 52),
+                        font_size=9,
+                        color="white",
+                        name="lbl_angled",
+                    )
+
+                    _ui["btn_zoom_in"] = map_fig.add_checkbox_button_widget(
+                        _on_zoom_in,
+                        value=False,
+                        position=(btn_x, 100),
+                        size=btn_size,
+                        border_size=2,
+                        color_on="limegreen",
+                        color_off="gray",
+                    )
+                    map_fig.add_text(
+                        "Zoom +",
+                        position=(btn_x + btn_size + 6, 102),
+                        font_size=9,
+                        color="white",
+                        name="lbl_zoom_in",
+                    )
+
+                    _ui["btn_zoom_out"] = map_fig.add_checkbox_button_widget(
+                        _on_zoom_out,
+                        value=False,
+                        position=(btn_x, 140),
+                        size=btn_size,
+                        border_size=2,
+                        color_on="limegreen",
+                        color_off="gray",
+                    )
+                    map_fig.add_text(
+                        "Zoom −",
+                        position=(btn_x + btn_size + 6, 142),
+                        font_size=9,
+                        color="white",
+                        name="lbl_zoom_out",
+                    )
 
                     map_fig.show(interactive_update=True, auto_close=False)
                 continue
@@ -526,7 +733,10 @@ def run_slam(cfg):
             # apply it if its answer is *close* to the incrementally
             # accumulated pose — preventing the submap from "resetting"
             # the pose back to the origin.
-            if submap_enabled and len(submap_buffer) > 0:
+            # Running every scan is expensive; `every_n` lets us skip
+            # most scans while still correcting drift regularly.
+            if (submap_enabled and len(submap_buffer) > 0
+                    and scans_processed % submap_every_n == 0):
                 submap = _build_submap(submap_buffer, submap_voxel)
 
                 r_sub, t_sub, err_sub = _attempt_submap_icp(
@@ -578,10 +788,15 @@ def run_slam(cfg):
             # ── update map incrementally ──────────────────────────────
             sensor_origin = global_pose[:2, 2]
             global_points = transform_points_2d(points, global_pose)
+            global_points_3d = transform_points_25d(points_3d, global_pose)
+            obs_mask = ((points_3d[:, 2] >= obstacle_z_min)
+                        & (points_3d[:, 2] <= obstacle_z_max))
             scan_history.append((points.copy(), global_pose.copy()))
+            scan_history_3d.append(points_3d.copy())
 
             if mapper is not None:
-                mapper.update_scan(sensor_origin, global_points)
+                mapper.update_scan(sensor_origin, global_points_3d,
+                                   obstacle_mask=obs_mask)
 
             if submap_enabled:
                 submap_buffer.append(global_points.copy())
@@ -644,13 +859,15 @@ def run_slam(cfg):
                     # Rebuild the occupancy grid from scratch
                     if mapper is not None:
                         print("  Rebuilding occupancy grid …")
-                        _rebuild_map(mapper, scan_history)
+                        _rebuild_map(mapper, scan_history, scan_history_3d,
+                                    obstacle_z_min=obstacle_z_min,
+                                    obstacle_z_max=obstacle_z_max)
 
             # ── live visualisation update ─────────────────────────────
             if live_map and map_grid is not None and mapper is not None:
                 mapper.update_pyvista_grid(map_grid)
                 map_fig.update_scalars(
-                    map_grid.cell_data["occ"], mesh=map_grid, render=False,
+                    map_grid.cell_data[color_by], mesh=map_grid, render=False,
                 )
                 positions = np.array([[p[0, 2], p[1, 2]] for p in pose_trajectory])
                 if positions.size > 0:
@@ -704,6 +921,11 @@ def main():
     if mapper is not None:
         mapper.save_csv(out_cfg.get("csv", "tmp/occupancy_grid.csv"))
         mapper.save_npy(out_cfg.get("npy", "tmp/occupancy_grid.npy"))
+        if mapper.has_elevation:
+            mapper.save_elevation_csv(
+                out_cfg.get("elevation_csv", "tmp/elevation_grid.csv"))
+            mapper.save_elevation_npy(
+                out_cfg.get("elevation_npy", "tmp/elevation_grid.npy"))
 
 
 if __name__ == "__main__":

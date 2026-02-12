@@ -210,16 +210,21 @@ def rotation_search(
     # Build KDTree on target once — each angle evaluation is O(N log M)
     tgt_tree = KDTree(tgt)
 
-    def _score(angle_rad):
-        ca, sa = np.cos(angle_rad), np.sin(angle_rad)
-        R = np.array([[ca, -sa], [sa, ca]])
-        rotated = src_c @ R.T + mu_t                     # rotate then shift to target centroid
-        dists, _ = tgt_tree.query(rotated)
-        return np.mean(dists ** 2)
+    def _batch_scores(angles):
+        """Score all rotation angles in one bulk KDTree query."""
+        ca = np.cos(angles)[:, None]              # (A, 1)
+        sa = np.sin(angles)[:, None]
+        x = src_c[:, 0][None, :]                  # (1, N)
+        y = src_c[:, 1][None, :]
+        rx = ca * x - sa * y + mu_t[0]            # (A, N)
+        ry = sa * x + ca * y + mu_t[1]
+        pts = np.column_stack([rx.ravel(), ry.ravel()])
+        dists, _ = tgt_tree.query(pts, workers=-1)
+        return np.mean(dists.reshape(len(angles), -1) ** 2, axis=1)
 
     # ── coarse sweep ──────────────────────────────────────────────────────
     angles_coarse = np.deg2rad(np.arange(-180, 180, angle_step_coarse))
-    scores_coarse = np.array([_score(a) for a in angles_coarse])
+    scores_coarse = _batch_scores(angles_coarse)
     best_idx = int(np.argmin(scores_coarse))
     best_angle = angles_coarse[best_idx]
 
@@ -227,7 +232,7 @@ def rotation_search(
     lo = best_angle - np.deg2rad(angle_step_coarse)
     hi = best_angle + np.deg2rad(angle_step_coarse)
     angles_fine = np.arange(lo, hi, np.deg2rad(angle_step_fine))
-    scores_fine = np.array([_score(a) for a in angles_fine])
+    scores_fine = _batch_scores(angles_fine)
     best_idx_f = int(np.argmin(scores_fine))
     best_angle = angles_fine[best_idx_f]
     best_score = scores_fine[best_idx_f]

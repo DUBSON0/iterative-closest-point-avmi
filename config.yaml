@@ -22,7 +22,7 @@ icp:
   voxel_size: 0.06
   error_threshold: 1.0e-10
   max_iterations: 100
-  error_reject_threshold: 0.25  # skip scan if ICP error > this value
+  error_reject_threshold: 1.0   # skip scan if ICP error > this value
 
 # --- Pre-alignment (handles large inter-scan rotations) ---
 # method: "rotation_search" | "features" | "both" | "none"
@@ -56,6 +56,7 @@ features:
 # multi-scan data have inconsistent sign that corrupts the point-to-line solver.
 submap:
   enabled: true           # false = fall back to scan-to-scan ICP
+  every_n: 3              # run submap ICP every Nth scan (1 = every scan; higher = faster)
   size: 30                # recent scans in the submap (more = more robust during turns)
   voxel_size: 0.06        # downsample density for the submap (≥ icp.voxel_size)
   max_corr_dist: 2.0      # metres — reject correspondences farther than this (needs slack for submap drift)
@@ -73,23 +74,31 @@ loop_closure:
                                 # trajectory since the candidate scan (prevents false closures
                                 # when the robot is still near the start and hasn't left yet)
   max_candidates: 3             # try up to N candidates per scan
-  error_threshold: 0.2          # max ICP error to accept a loop closure (higher than sequential!)
+  error_threshold: 0.3         # max ICP error to accept a loop closure (higher than sequential!)
   optimization_iterations: 20   # Gauss-Newton iterations
   information_scale: 1.0        # weight multiplier for loop-closure edges vs odometry
 
-# --- Point cloud filter (z-slice before flattening to 2D) ---
+# --- Point cloud filter ---
 filter:
-  z_min: -100.0    # meters – discard points below this height
-  z_max: 100.0    # meters – discard points above this height
+  z_min: -100.0        # meters – hard discard below this height (noise gate)
+  z_max: 100.0         # meters – hard discard above this height (noise gate)
+  max_range: 1000.0      # meters – discard points farther than this (xy distance from sensor)
+  # Ground / obstacle split (sensor-frame z):
+  #   z < obstacle_z_min  ->  ground (elevation only, NOT marked as obstacle)
+  #   obstacle_z_min <= z <= obstacle_z_max  ->  obstacle (elevation + occupancy)
+  #   z > obstacle_z_max  ->  overhead / noise (elevation only)
+  obstacle_z_min: 0.3   # meters above sensor – below this is terrain
+  obstacle_z_max: 3.0   # meters above sensor – above this is overhead noise
 
 # --- Occupancy grid / mapping ---
 mapping:
-  resolution: 0.1     # meters per cell
+  resolution: 0.2     # meters per cell
   margin: 50.0        # meters of padding around first scan bounds
   p_hit: 0.9          # probability update for occupied cells (higher = harder to erase)
   p_miss: 0.45        # probability update for free (ray) cells (closer to 0.5 = weaker free updates)
   log_odds_min: -10.0  # clamp lower bound (larger range = more permanence)
   log_odds_max: 10.0   # clamp upper bound
+  elevation_scale: 1.0  # vertical exaggeration for 2.5-D display (1.0 = true scale)
 
 # --- Lidar service ---
 service:
@@ -105,9 +114,12 @@ display:
   live_map: true
   window_width: 1400
   window_height: 1000
-  cmap: "gray"
-  clim_min: 0.0
-  clim_max: 1.0
+  color_by: "elevation"   # "elevation" (height-coloured terrain) or "occ" (occupancy grid)
+  cmap: "terrain"          # colormap: "terrain", "viridis", "inferno", "gray", etc.
+  nan_color: "gray"        # colour for unexplored cells (NaN elevation)
+  # clim_min / clim_max: set both to fix the colour range, or omit for auto-scale
+  # clim_min: -2.0
+  # clim_max: 10.0
   background: "black"
   trajectory_color: "cyan"
   pose_color: "lime"
@@ -117,3 +129,5 @@ display:
 output:
   csv: "tmp/occupancy_grid.csv"
   npy: "tmp/occupancy_grid.npy"
+  elevation_csv: "tmp/elevation_grid.csv"
+  elevation_npy: "tmp/elevation_grid.npy"

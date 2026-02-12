@@ -49,30 +49,47 @@ def find_nearest_neighbor_indices(source, target, tree=None):
 # ── Point-to-line helpers (2-D only) ─────────────────────────────────────────
 
 def estimate_normals_2d(points, k=10):
-    """Estimate 2-D surface normals via PCA of k-nearest neighbours.
+    """Estimate 2-D surface normals via closed-form 2×2 eigendecomposition.
 
-    The normal at each point is the eigenvector corresponding to the
-    *smallest* eigenvalue of the local covariance — i.e. perpendicular
-    to the dominant surface direction.
+    Fully vectorised — no Python loop.  For each point the normal is the
+    eigenvector of the *smallest* eigenvalue of the local 2×2 covariance
+    (perpendicular to the dominant surface direction).
 
     Returns an (N, 2) array of unit normals.
     """
     n = len(points)
     k = min(k, n - 1)
 
-    # Single KDTree query for ALL neighbour lookups — O(N k log N)
-    # instead of O(N²) brute-force.
     tree = KDTree(points)
-    _, nn_all = tree.query(points, k=k + 1)             # (N, k+1) — includes self
+    _, nn_all = tree.query(points, k=k + 1)             # (N, k+1) includes self
 
-    normals = np.zeros_like(points)
-    for i in range(n):
-        nbrs = points[nn_all[i]]
-        cov = np.cov(nbrs.T)
-        eigvals, eigvecs = np.linalg.eigh(cov)          # ascending eigenvalues
-        normals[i] = eigvecs[:, 0]                       # smallest → normal
-    norms = np.linalg.norm(normals, axis=1, keepdims=True)
-    normals /= np.maximum(norms, 1e-10)
+    # Gather all neighbour coordinates: (N, k+1, 2)
+    nbrs = points[nn_all]
+    centroids = nbrs.mean(axis=1)                        # (N, 2)
+    centered = nbrs - centroids[:, np.newaxis, :]        # (N, k+1, 2)
+
+    # Batch 2×2 covariance entries: [[a, b], [b, c]]
+    dx = centered[:, :, 0]                               # (N, k+1)
+    dy = centered[:, :, 1]
+    a = np.sum(dx * dx, axis=1)                          # (N,)
+    b = np.sum(dx * dy, axis=1)
+    c = np.sum(dy * dy, axis=1)
+
+    # Closed-form smallest eigenvector of [[a, b], [b, c]]
+    disc = np.sqrt(np.maximum((a - c) ** 2 + 4.0 * b * b, 0.0))
+    lam_min = 0.5 * (a + c - disc)
+
+    nx = b.copy()
+    ny = lam_min - a
+
+    # Degenerate case (b ≈ 0): eigenvectors align with axes
+    degen = np.abs(b) < 1e-12
+    nx[degen] = np.where(a[degen] <= c[degen], 1.0, 0.0)
+    ny[degen] = np.where(a[degen] <= c[degen], 0.0, 1.0)
+
+    norms = np.sqrt(nx * nx + ny * ny)
+    norms = np.maximum(norms, 1e-10)
+    normals = np.column_stack([nx / norms, ny / norms])
     return normals
 
 
@@ -115,14 +132,31 @@ def _point_to_line_solve_2d(source_pts, target_pts, target_normals, nn_indices):
     return R, t
 
 def voxel_downsample(points, voxel_size):
+    """Average points falling into the same voxel cell.
+
+    Uses 1-D keys derived from grid indices so ``np.unique`` operates on
+    a flat int64 array (O(N log N) sort on scalars) instead of doing
+    expensive row-wise comparison on the 2-D/3-D index array.
+    """
     dim = points.shape[1]
     min_bound = np.min(points, axis=0)
-    voxel_indices = np.floor((points - min_bound) / voxel_size).astype(int)
-    unique_indices, inv = np.unique(voxel_indices, axis=0, return_inverse=True)
-    n_unique = len(unique_indices)
+    vi = np.floor((points - min_bound) / voxel_size).astype(np.int64)
+
+    # ── 1-D key for fast np.unique ────────────────────────────────────
+    if dim <= 3:
+        spans = vi.max(axis=0) + 1
+        if dim == 2:
+            keys = vi[:, 0] * spans[1] + vi[:, 1]
+        else:  # dim == 3
+            keys = (vi[:, 0] * spans[1] + vi[:, 1]) * spans[2] + vi[:, 2]
+        _, inv = np.unique(keys, return_inverse=True)
+    else:
+        _, inv = np.unique(vi, axis=0, return_inverse=True)
+
+    n_unique = int(inv.max() + 1) if len(inv) > 0 else 0
     counts = np.bincount(inv, minlength=n_unique).astype(np.float64)
     downsampled = np.empty((n_unique, dim))
-    for d in range(dim):          # only 2 iterations for 2-D
+    for d in range(dim):          # only 2–3 iterations
         downsampled[:, d] = np.bincount(inv, weights=points[:, d],
                                         minlength=n_unique)
     downsampled /= counts[:, np.newaxis]
