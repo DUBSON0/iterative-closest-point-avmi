@@ -21,10 +21,20 @@ def load_config(path="config.yaml"):
         return yaml.safe_load(f)
 
 
-def filter_and_flatten(points, z_min=0.2, z_max=2.0):
-    """Keep only points with z in [z_min, z_max], then return x,y only."""
+def filter_points(points, z_min=0.2, z_max=2.0):
+    """Keep only points with z in [z_min, z_max].
+
+    Returns
+    -------
+    points_2d : ndarray, shape (M, 2)
+        Filtered points projected to x, y (for ICP).
+    points_3d : ndarray, shape (M, 3)
+        Filtered points with original z preserved (for 2.5-D mapping).
+    """
     mask = (points[:, 2] >= z_min) & (points[:, 2] <= z_max)
-    return points[mask, :2].copy()
+    pts_3d = points[mask].copy()
+    pts_2d = pts_3d[:, :2].copy()
+    return pts_2d, pts_3d
 
 
 def compute_bounds_from_scan(points_2d, margin=50.0):
@@ -48,6 +58,15 @@ def transform_points_2d(points_2d, pose):
     R = pose[:2, :2]
     t = pose[:2, 2]
     return points_2d @ R.T + t
+
+
+def transform_points_25d(points_3d, pose):
+    """Apply a 2-D pose to x, y while preserving z (for 2.5-D mapping)."""
+    R = pose[:2, :2]
+    t = pose[:2, 2]
+    result = points_3d.copy()
+    result[:, :2] = points_3d[:, :2] @ R.T + t
+    return result
 
 
 def _run_icp_pair(source, target, icp_cfg, feat_cfg, alignment_method):
@@ -268,12 +287,15 @@ def _find_loop_candidates(current_pose, scan_history, current_idx,
     return candidates[:max_candidates]
 
 
-def _rebuild_map(mapper, scan_history):
+def _rebuild_map(mapper, scan_history, scan_history_3d=None):
     """Clear the occupancy grid and replay every scan with its current pose."""
     mapper.reset()
-    for (pts, pose) in scan_history:
+    for k, (pts_2d, pose) in enumerate(scan_history):
         origin = pose[:2, 2]
-        global_pts = transform_points_2d(pts, pose)
+        if scan_history_3d is not None:
+            global_pts = transform_points_25d(scan_history_3d[k], pose)
+        else:
+            global_pts = transform_points_2d(pts_2d, pose)
         mapper.update_scan(origin, global_pts)
 
 

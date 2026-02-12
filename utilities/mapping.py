@@ -11,12 +11,17 @@ UNEXPLORED = 0.0   # log-odds = 0 → probability 0.5
 
 
 class OccupancyGrid2D:
-    """2D probabilistic occupancy grid with log-odds ray tracing.
+    """2-D probabilistic occupancy grid with log-odds ray tracing and
+    optional 2.5-D elevation tracking.
 
     Each cell stores a log-odds value:
         log_odds > 0  →  occupied
         log_odds < 0  →  free
         log_odds = 0  →  unexplored
+
+    When 3-D hit points are supplied (shape (N, 3)) the grid also tracks
+    a running-mean elevation (z) per cell, enabling 2.5-D terrain
+    visualisation.
 
     update_scan() traces a ray from the sensor origin to each hit point,
     marking cells along the ray as free and the endpoint as occupied.
@@ -34,6 +39,7 @@ class OccupancyGrid2D:
         p_miss=0.4,
         log_odds_min=-5.0,
         log_odds_max=5.0,
+        elevation_scale=1.0,
     ):
         self.min_x = float(min_x)
         self.max_x = float(max_x)
@@ -50,6 +56,11 @@ class OccupancyGrid2D:
         self.l_miss = np.log(p_miss / (1.0 - p_miss))
         self.log_odds_min = float(log_odds_min)
         self.log_odds_max = float(log_odds_max)
+
+        # ── 2.5-D elevation tracking ─────────────────────────────────
+        self.elevation_sum = np.zeros((self.ny, self.nx), dtype=np.float64)
+        self.elevation_count = np.zeros((self.ny, self.nx), dtype=np.int32)
+        self.elevation_scale = float(elevation_scale)
 
     # ------------------------------------------------------------------
     # Coordinate helpers
@@ -107,11 +118,14 @@ class OccupancyGrid2D:
         ----------
         origin_xy : array-like, shape (2,)
             Sensor position in world frame (x, y).
-        hit_points : ndarray, shape (N, 2)
-            Hit positions in world frame (x, y).
+        hit_points : ndarray, shape (N, 2) or (N, 3)
+            Hit positions in world frame.  If three columns are provided
+            the third column (z) is used for 2.5-D elevation tracking.
         """
         if hit_points.size == 0:
             return
+
+        has_z = hit_points.ndim == 2 and hit_points.shape[1] >= 3
 
         ox, oy = self._world_to_grid(origin_xy[0], origin_xy[1])
 
@@ -128,6 +142,14 @@ class OccupancyGrid2D:
         if valid.any():
             np.add.at(self.log_odds, (hy_all[valid], hx_all[valid]), self.l_hit)
 
+            # ── elevation tracking ────────────────────────────────────
+            if has_z:
+                z_vals = hit_points[valid, 2]
+                np.add.at(self.elevation_sum,
+                          (hy_all[valid], hx_all[valid]), z_vals)
+                np.add.at(self.elevation_count,
+                          (hy_all[valid], hx_all[valid]), 1)
+
         # ── free cells along each ray (Bresenham) ─────────────────────
         nx, ny = self.nx, self.ny
         l_miss = self.l_miss
@@ -141,8 +163,10 @@ class OccupancyGrid2D:
         np.clip(log_odds, self.log_odds_min, self.log_odds_max, out=log_odds)
 
     def reset(self):
-        """Zero out all log-odds (back to unexplored)."""
+        """Zero out all log-odds and elevation (back to unexplored)."""
         self.log_odds[:] = 0.0
+        self.elevation_sum[:] = 0.0
+        self.elevation_count[:] = 0
 
     # ------------------------------------------------------------------
     # Probability / display
@@ -157,22 +181,72 @@ class OccupancyGrid2D:
         return 1.0 - self.to_probability()
 
     # ------------------------------------------------------------------
+    # Elevation helpers
+    # ------------------------------------------------------------------
+    @property
+    def elevation(self):
+        """Per-cell mean elevation (z).  NaN for unobserved cells."""
+        out = np.full((self.ny, self.nx), np.nan, dtype=np.float32)
+        mask = self.elevation_count > 0
+        out[mask] = (self.elevation_sum[mask]
+                     / self.elevation_count[mask]).astype(np.float32)
+        return out
+
+    def _vertex_elevation(self):
+        """Interpolate cell-centred elevation to vertex positions.
+
+        Returns array of shape (ny+1, nx+1) suitable for StructuredGrid
+        vertex z-coordinates.  Unobserved cells contribute z = 0.
+        """
+        elev = np.nan_to_num(self.elevation, nan=0.0)
+        # Pad with edge replication so the 2×2 average yields (ny+1, nx+1)
+        padded = np.pad(elev, ((1, 1), (1, 1)), mode='edge')
+        vz = 0.25 * (padded[:-1, :-1] + padded[:-1, 1:] +
+                      padded[1:, :-1] + padded[1:, 1:])
+        return vz * self.elevation_scale
+
+    @property
+    def has_elevation(self):
+        """True if any cell has received elevation data."""
+        return bool(np.any(self.elevation_count > 0))
+
+    # ------------------------------------------------------------------
     # PyVista helpers
     # ------------------------------------------------------------------
     def _flat_cell_data(self):
         return self.to_display().ravel(order="C")
 
     def create_pyvista_grid(self):
-        grid = pv.ImageData(
-            dimensions=(self.nx + 1, self.ny + 1, 1),
-            spacing=(self.resolution, self.resolution, 1e-6),
-            origin=(self.min_x, self.min_y, 0.0),
-        )
+        """Create a PyVista StructuredGrid with 2.5-D elevation support.
+
+        Vertex z-coordinates reflect the tracked terrain elevation
+        (scaled by ``elevation_scale``), allowing 3-D visualisation when
+        the camera is tilted.
+        """
+        xs = np.linspace(self.min_x,
+                         self.min_x + self.nx * self.resolution,
+                         self.nx + 1)
+        ys = np.linspace(self.min_y,
+                         self.min_y + self.ny * self.resolution,
+                         self.ny + 1)
+        xx, yy = np.meshgrid(xs, ys)
+        zz = self._vertex_elevation()
+
+        grid = pv.StructuredGrid()
+        grid.dimensions = [self.nx + 1, self.ny + 1, 1]
+        grid.points = np.column_stack([xx.ravel(), yy.ravel(),
+                                       zz.ravel()])
         grid.cell_data["occ"] = self._flat_cell_data()
         return grid
 
     def update_pyvista_grid(self, grid):
+        """Refresh both occupancy colours and vertex elevation."""
         grid.cell_data["occ"] = self._flat_cell_data()
+        # Update vertex z for elevation changes
+        zz = self._vertex_elevation()
+        pts = grid.points.copy()
+        pts[:, 2] = zz.ravel()
+        grid.points = pts
 
     # ------------------------------------------------------------------
     # Export
@@ -182,3 +256,11 @@ class OccupancyGrid2D:
 
     def save_npy(self, file_path):
         np.save(file_path, self.to_probability())
+
+    def save_elevation_csv(self, file_path):
+        """Save per-cell elevation as CSV (NaN for unobserved cells)."""
+        np.savetxt(file_path, self.elevation, delimiter=",")
+
+    def save_elevation_npy(self, file_path):
+        """Save per-cell elevation as .npy (NaN for unobserved cells)."""
+        np.save(file_path, self.elevation)
