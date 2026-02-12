@@ -3,11 +3,12 @@ import yaml
 import numpy as np
 import pyvista as pv
 
-import lidar_service
-import mapping
-from icp import ICP, voxel_downsample
-from features import feature_based_alignment, rotation_search
-from pose_graph import (
+from services.lidar_service import LidarService
+from services.imu_service import IMUService
+from utilities.icp import ICP, voxel_downsample
+from utilities.features import feature_based_alignment, rotation_search
+from utilities.mapping import OccupancyGrid2D
+from utilities.pose_graph import (
     PoseGraph2D,
     pose_matrix_to_vec,
     relative_transform_vec,
@@ -112,9 +113,10 @@ def _submap_rotation_search(source_local, submap_global, predicted_pose,
                              fine_step=0.5, voxel_size=0.3):
     """Search rotation around predicted pose for best submap alignment.
 
-    Keeps the predicted translation fixed and tries rotation offsets
-    in [-angle_range, +angle_range] degrees.  Returns (R, t) for the
-    best-scoring angle.
+    Tries rotation offsets in [-angle_range, +angle_range] degrees.
+    After finding the best rotation, **refines the translation** with a
+    single nearest-neighbour centroid step so the returned (R, t) is no
+    longer locked to the predicted translation.
     """
     src = voxel_downsample(source_local, voxel_size)
     tgt = voxel_downsample(submap_global, voxel_size)
@@ -158,7 +160,70 @@ def _submap_rotation_search(source_local, submap_global, predicted_pose,
 
     ca, sa = np.cos(best_angle), np.sin(best_angle)
     R_best = np.array([[ca, -sa], [sa, ca]])
-    return R_best, pred_t
+
+    # ── refine translation with one NN centroid step ──────────────────
+    # Without this the translation is exactly the predicted one, which
+    # is wrong whenever the constant-velocity model mispredicts
+    # (e.g. reversal, stop, sudden acceleration).
+    rotated_src = src @ R_best.T
+    placed = rotated_src + pred_t
+    placed_sq = np.sum(placed ** 2, axis=1, keepdims=True)
+    D_nn = np.maximum(placed_sq + tgt_sq.T - 2.0 * placed @ tgt.T, 0.0)
+    nn_idx = np.argmin(D_nn, axis=1)
+    nn_dists = D_nn[np.arange(len(nn_idx)), nn_idx]
+    # Keep the closest 80 % to suppress outlier correspondences
+    dist_thresh = np.percentile(nn_dists, 80)
+    inlier_mask = nn_dists <= dist_thresh
+    if inlier_mask.sum() >= 5:
+        matched = tgt[nn_idx]
+        refined_t = np.mean(matched[inlier_mask] - rotated_src[inlier_mask],
+                            axis=0)
+    else:
+        refined_t = pred_t
+
+    return R_best, refined_t
+
+
+def _attempt_submap_icp(source, submap, predicted,
+                         imu_yaw, imu_narrow,
+                         sub_rot_range, sub_rot_step, sub_rot_fine,
+                         sub_rot_voxel, icp_cfg, sub_corr_dist):
+    """Run rotation-search + point-to-point ICP against *submap*.
+
+    If *imu_yaw* is not None the predicted rotation is overridden with
+    the IMU absolute yaw and only a narrow search (± *imu_narrow* °) is
+    performed; otherwise the full rotation range is swept.
+
+    Returns ``(r, t, error)`` — same convention as ``ICP()``.
+    """
+    pred = predicted.copy()
+
+    if imu_yaw is not None:
+        ca, sa = np.cos(imu_yaw), np.sin(imu_yaw)
+        pred[:2, :2] = np.array([[ca, -sa], [sa, ca]])
+        angle_range = imu_narrow
+        angle_step  = 0.5
+    else:
+        angle_range = sub_rot_range
+        angle_step  = sub_rot_step
+
+    R_init, t_init = _submap_rotation_search(
+        source, submap, pred,
+        angle_range=angle_range,
+        angle_step=angle_step,
+        fine_step=sub_rot_fine,
+        voxel_size=sub_rot_voxel,
+    )
+
+    return ICP(
+        source, submap,
+        error_threshold=icp_cfg.get("error_threshold", 1e-7),
+        max_iterations=icp_cfg.get("max_iterations", 100),
+        voxel_size=icp_cfg.get("voxel_size", 0.06),
+        R_init=R_init, t_init=t_init,
+        method="point_to_point",
+        max_corr_dist=sub_corr_dist,
+    )
 
 
 # ── Loop-closure helpers ─────────────────────────────────────────────────────
@@ -248,8 +313,17 @@ def run_slam(cfg):
 
     data_file = cfg.get("data_file", "data/ugvlidar-full.csv")
 
+    # ── IMU configuration ─────────────────────────────────────────────
+    imu_cfg     = cfg.get("imu", {})
+    imu_enabled = imu_cfg.get("enabled", False)
+    imu_file    = imu_cfg.get("file", "")
+    imu_narrow  = imu_cfg.get("narrow_search_range", 5.0)   # degrees around IMU yaw
+    imu = None
+    if imu_enabled and imu_file:
+        imu = IMUService(imu_file)
+
     # ── state ─────────────────────────────────────────────────────────
-    service = lidar_service.LidarService(data_file, sleep_s=sleep_s, loop=loop)
+    service = LidarService(data_file, sleep_s=sleep_s, loop=loop)
     scan_stream = service.scans()
     global_pose = np.eye(3)
     pose_trajectory = []          # list of 3×3 matrices (for display)
@@ -259,6 +333,7 @@ def run_slam(cfg):
     scans_processed = 0
     submap_buffer = []            # recent scans in global frame
     last_delta = None             # incremental pose for motion prediction
+    prev_rel_time = None          # for IMU delta yaw
 
     # Pose graph
     pose_graph = PoseGraph2D()
@@ -270,7 +345,7 @@ def run_slam(cfg):
     pose_mesh = None
 
     try:
-        for timestamp, raw_points in scan_stream:
+        for timestamp, rel_time_us, raw_points in scan_stream:
             points = filter_and_flatten(raw_points, z_min=z_min, z_max=z_max)
             if points.shape[0] < 10:
                 continue
@@ -278,8 +353,9 @@ def run_slam(cfg):
             # ── first scan (initialisation) ───────────────────────────
             if prev_points is None:
                 prev_points = points
+                prev_rel_time = rel_time_us
                 min_x, max_x, min_y, max_y = compute_bounds_from_scan(points, margin=map_margin)
-                mapper = mapping.OccupancyGrid2D(
+                mapper = OccupancyGrid2D(
                     min_x=min_x, max_x=max_x,
                     min_y=min_y, max_y=max_y,
                     resolution=map_resolution,
@@ -335,40 +411,80 @@ def run_slam(cfg):
                     map_fig.show(interactive_update=True, auto_close=False)
                 continue
 
+            # ── IMU yaw for this scan ─────────────────────────────────
+            imu_yaw = None
+            imu_delta = None
+            if imu is not None:
+                imu_yaw = imu.yaw_at(rel_time_us)
+                if prev_rel_time is not None:
+                    imu_delta = imu.delta_yaw(prev_rel_time, rel_time_us)
+
             # ── ICP alignment ─────────────────────────────────────────
             icp_ok = False
 
             if submap_enabled and len(submap_buffer) > 0:
-                # --- Strategy 1: scan-to-submap ---
+                # --- Strategy 1: scan-to-submap (multi-hypothesis) ---
                 submap = _build_submap(submap_buffer, submap_voxel)
 
-                # Constant-velocity motion prediction
+                # ── Attempt 1: constant-velocity prediction ───────────
                 if last_delta is not None:
                     predicted = global_pose @ last_delta
                 else:
                     predicted = global_pose.copy()
 
-                # Rotation search around the predicted pose to handle turns
-                R_init, t_init = _submap_rotation_search(
+                r, t, error = _attempt_submap_icp(
                     points, submap, predicted,
-                    angle_range=sub_rot_range,
-                    angle_step=sub_rot_step,
-                    fine_step=sub_rot_fine,
-                    voxel_size=sub_rot_voxel,
+                    imu_yaw, imu_narrow,
+                    sub_rot_range, sub_rot_step, sub_rot_fine,
+                    sub_rot_voxel, icp_cfg, sub_corr_dist,
                 )
 
-                # Use point-to-point for submap (normals from merged
-                # multi-scan data have inconsistent signs that corrupt
-                # point-to-line ICP — the "negativity" problem).
-                r, t, error = ICP(
-                    points, submap,
-                    error_threshold=icp_cfg.get("error_threshold", 1e-7),
-                    max_iterations=icp_cfg.get("max_iterations", 100),
-                    voxel_size=icp_cfg.get("voxel_size", 0.06),
-                    R_init=R_init, t_init=t_init,
-                    method="point_to_point",
-                    max_corr_dist=sub_corr_dist,
-                )
+                # ── Attempt 2: zero-velocity (handles reversal/stop) ─
+                if error > error_reject_threshold and last_delta is not None:
+                    print(f"  Motion-predicted ICP error {error:.4f} — "
+                          f"retrying with zero-velocity …")
+                    r2, t2, err2 = _attempt_submap_icp(
+                        points, submap, global_pose.copy(),
+                        imu_yaw, imu_narrow,
+                        sub_rot_range, sub_rot_step, sub_rot_fine,
+                        sub_rot_voxel, icp_cfg, sub_corr_dist,
+                    )
+                    if err2 < error:
+                        r, t, error = r2, t2, err2
+                        print(f"  Zero-velocity retry → error {error:.4f}")
+
+                # ── IMU yaw consistency guard ─────────────────────────
+                # If ICP converged but introduced a rotation the IMU
+                # disagrees with, clamp to the IMU yaw and re-derive
+                # the translation via a single NN centroid step.
+                if error <= error_reject_threshold and imu_yaw is not None:
+                    icp_yaw = np.arctan2(r[1, 0], r[0, 0])
+                    yaw_diff = (icp_yaw - imu_yaw + np.pi) % (2 * np.pi) - np.pi
+                    if abs(yaw_diff) > np.deg2rad(15.0):
+                        print(f"  ICP yaw {np.degrees(icp_yaw):.1f}° vs "
+                              f"IMU {np.degrees(imu_yaw):.1f}° "
+                              f"(Δ {np.degrees(yaw_diff):+.1f}°) — "
+                              f"clamping to IMU")
+                        ca, sa = np.cos(imu_yaw), np.sin(imu_yaw)
+                        r = np.array([[ca, -sa], [sa, ca]])
+                        # Re-derive translation with corrected rotation
+                        ds = voxel_downsample(
+                            points, icp_cfg.get("voxel_size", 0.06))
+                        rotated = ds @ r.T
+                        placed = rotated + t          # ICP's t as seed
+                        ds_sub = voxel_downsample(
+                            submap, icp_cfg.get("voxel_size", 0.06))
+                        dists_sq = np.sum(
+                            (placed[:, None, :] - ds_sub[None, :, :]) ** 2,
+                            axis=2,
+                        )
+                        nn_idx = np.argmin(dists_sq, axis=1)
+                        nn_d = dists_sq[np.arange(len(nn_idx)), nn_idx]
+                        keep = nn_d <= np.percentile(nn_d, 80)
+                        if keep.sum() >= 5:
+                            matched = ds_sub[nn_idx]
+                            t = np.mean(
+                                matched[keep] - rotated[keep], axis=0)
 
                 if error <= error_reject_threshold:
                     prev_global = global_pose.copy()
@@ -384,13 +500,30 @@ def run_slam(cfg):
                           f"falling back to scan-to-scan")
 
             if not icp_ok:
-                # --- Strategy 2 / fallback: scan-to-scan with rotation search ---
-                r, t, error = _run_icp_pair(
-                    prev_points, points, icp_cfg, feat_cfg, alignment_method,
-                )
+                # --- Strategy 2 / fallback: scan-to-scan ---
+                if imu_delta is not None:
+                    # Use IMU delta yaw as initial rotation guess
+                    ca, sa = np.cos(imu_delta), np.sin(imu_delta)
+                    R_imu = np.array([[ca, -sa], [sa, ca]])
+                    t_imu = np.zeros(2)
+                    r, t, error = ICP(
+                        prev_points, points,
+                        error_threshold=icp_cfg.get("error_threshold", 1e-7),
+                        max_iterations=icp_cfg.get("max_iterations", 100),
+                        voxel_size=icp_cfg.get("voxel_size", 0.06),
+                        R_init=R_imu, t_init=t_imu,
+                        method=icp_cfg.get("method", "point_to_line"),
+                        normal_k=icp_cfg.get("normal_k", 10),
+                    )
+                else:
+                    # No IMU — full rotation search
+                    r, t, error = _run_icp_pair(
+                        prev_points, points, icp_cfg, feat_cfg, alignment_method,
+                    )
                 if error > error_reject_threshold:
                     print(f"Scan {scans_processed}: error {error:.6f} too high, skipping")
                     prev_points = points
+                    prev_rel_time = rel_time_us
                     scans_processed += 1
                     continue
                 global_pose = apply_incremental_pose_2d(global_pose, r, t)
@@ -499,6 +632,7 @@ def run_slam(cfg):
                 map_fig.iren.process_events()
 
             prev_points = points
+            prev_rel_time = rel_time_us
             scans_processed += 1
             if num_scans is not None and scans_processed >= num_scans:
                 break
