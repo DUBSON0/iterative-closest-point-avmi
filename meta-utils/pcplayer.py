@@ -19,6 +19,7 @@ import os
 import sys
 import time
 import argparse
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -61,28 +62,80 @@ def _detect_format(path: Path) -> str:
 
 
 # ── Loaders ─────────────────────────────────────────────────────────────────
-def _parse_lidar_line(line: str) -> tuple[int, np.ndarray]:
-    """Parse a semicolon-delimited lidar row → (timestamp, Nx3 points)."""
-    parts = line.strip().split(";")
-    timestamp = int(parts[0])
-    floats = np.array([float(v) for v in parts[1:]], dtype=np.float64)
-    if floats.size % 3 != 0:
-        raise ValueError("Lidar row values are not a multiple of 3")
-    points = floats.reshape(-1, 3)
+def _parse_lidar_line_fast(line: str) -> tuple[int, np.ndarray]:
+    """Parse a semicolon-delimited lidar row using numpy (fast path)."""
+    # Replace semicolons with spaces so np.fromstring can parse in C
+    raw = line.strip().replace(";", " ")
+    vals = np.fromstring(raw, dtype=np.float64, sep=" ")
+    timestamp = int(vals[0])
+    coords = vals[1:]
+    remainder = coords.size % 3
+    if remainder:
+        coords = coords[: coords.size - remainder]
+    points = coords.reshape(-1, 3)
     # Drop all-zero points (padding)
     mask = np.any(points != 0, axis=1)
     return timestamp, points[mask]
 
 
+class LidarFrameStream:
+    """Loads lidar frames in a background thread so playback can start
+    as soon as the first frame is ready."""
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._frames: list[tuple[int, np.ndarray]] = []
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._total_lines: int | None = None
+
+    @property
+    def done(self) -> bool:
+        return self._done.is_set()
+
+    @property
+    def total(self) -> int | None:
+        return self._total_lines
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._frames)
+
+    def get(self, idx: int) -> tuple[int, np.ndarray] | None:
+        with self._lock:
+            if idx < len(self._frames):
+                return self._frames[idx]
+        return None
+
+    def start(self):
+        t = threading.Thread(target=self._load, daemon=True)
+        t.start()
+
+    def _load(self):
+        # First pass: count lines for progress (very fast, just reads newlines)
+        with open(self._path) as f:
+            self._total_lines = sum(1 for line in f if line.strip())
+
+        with open(self._path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                frame = _parse_lidar_line_fast(line)
+                with self._lock:
+                    self._frames.append(frame)
+        self._done.set()
+
+
 def load_lidar_frames(path: Path) -> list[tuple[int, np.ndarray]]:
-    """Load all lidar frames from a semicolon-delimited CSV."""
+    """Load all lidar frames (blocking). Used when streaming isn't needed."""
     frames = []
     with open(path) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            frames.append(_parse_lidar_line(line))
+            frames.append(_parse_lidar_line_fast(line))
     return frames
 
 
@@ -125,17 +178,24 @@ def downsample(points: np.ndarray, stride: int = 1,
 
 
 # ── Playback ────────────────────────────────────────────────────────────────
-def play_lidar(frames: list[tuple[int, np.ndarray]],
-               stride: int, voxel_size: float,
-               point_size: float, fps: float,
-               color: str, bg: str, window_size: tuple[int, int]):
-    """Animate lidar frames in a PyVista window."""
-    if not frames:
+def play_lidar_stream(stream: LidarFrameStream,
+                      stride: int, voxel_size: float,
+                      point_size: float, fps: float,
+                      color: str, bg: str, window_size: tuple[int, int]):
+    """Animate lidar frames, consuming them from a background stream."""
+
+    # Wait for at least the first frame
+    while stream.count() == 0 and not stream.done:
+        time.sleep(0.01)
+
+    if stream.count() == 0:
         print("No frames to play.")
         return
 
     delay = 1.0 / fps if fps > 0 else 0.0
-    first_pts = downsample(frames[0][1], stride, voxel_size)
+    first_frame = stream.get(0)
+    assert first_frame is not None
+    first_pts = downsample(first_frame[1], stride, voxel_size)
     cloud = pv.PolyData(first_pts)
 
     plotter = pv.Plotter(window_size=window_size)
@@ -144,28 +204,44 @@ def play_lidar(frames: list[tuple[int, np.ndarray]],
                      render_points_as_spheres=False, name="cloud")
     plotter.add_axes(line_width=2, labels_off=False)
 
-    title_actor = plotter.add_text(
-        f"Scan 1/{len(frames)}  |  {len(first_pts)} pts",
+    total_str = str(stream.total) if stream.total else "?"
+    plotter.add_text(
+        f"Scan 1/{total_str}  |  {len(first_pts)} pts",
         position="upper_left", font_size=12, color="white", name="title",
     )
 
     plotter.show(interactive_update=True, auto_close=False)
 
-    for i, (ts, pts) in enumerate(frames):
+    idx = 0
+    while True:
+        frame = stream.get(idx)
+        if frame is None:
+            # Haven't loaded this frame yet — wait or finish
+            if stream.done:
+                break
+            time.sleep(0.005)
+            continue
+
+        ts, pts = frame
         ds = downsample(pts, stride, voxel_size)
-        # Rebuild mesh each frame (point count can change between scans)
+
         plotter.remove_actor("cloud")
         cloud = pv.PolyData(ds)
         plotter.add_mesh(cloud, color=color, point_size=point_size,
                          render_points_as_spheres=False, name="cloud")
+
+        total_str = str(stream.total) if stream.total else "?"
+        loaded = stream.count()
+        loading_tag = "" if stream.done else f"  (loaded {loaded})"
         plotter.remove_actor("title")
         plotter.add_text(
-            f"Scan {i + 1}/{len(frames)}  |  {len(ds)} pts  |  ts {ts}",
+            f"Scan {idx + 1}/{total_str}  |  {len(ds)} pts  |  ts {ts}{loading_tag}",
             position="upper_left", font_size=12, color="white", name="title",
         )
         plotter.update()
         if delay > 0:
             time.sleep(delay)
+        idx += 1
 
     # Keep window open after playback
     plotter.show(interactive_update=False, auto_close=False)
@@ -244,12 +320,12 @@ def main():
 
     # ── Load & play ─────────────────────────────────────────────────────
     if fmt == "lidar":
-        print("Loading lidar frames …")
-        frames = load_lidar_frames(chosen)
-        print(f"Loaded {len(frames)} frames")
-        play_lidar(frames, args.stride, args.voxel,
-                   args.point_size, args.fps,
-                   args.color, args.bg, ws)
+        print("Streaming lidar frames (background loading) …")
+        stream = LidarFrameStream(chosen)
+        stream.start()
+        play_lidar_stream(stream, args.stride, args.voxel,
+                          args.point_size, args.fps,
+                          args.color, args.bg, ws)
     else:
         print("Loading static point cloud …")
         points = load_simple_cloud(chosen)

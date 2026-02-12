@@ -3,7 +3,7 @@
 # ============================================================
 
 # --- Data source ---
-data_file: "data/test3lidar_trimmed.csv"
+data_file: "data/1003lidar_trimmed.csv"
 
 # --- IMU orientation (quaternion) ---
 # When enabled the gyro-derived absolute yaw replaces the expensive rotation
@@ -11,7 +11,7 @@ data_file: "data/test3lidar_trimmed.csv"
 # delimited with columns: timestamp_us ; qx ; qy ; qz ; qw
 imu:
   enabled: true
-  file: "data/test3imu_trimmed.csv"
+  file: "data/1003imu_trimmed.csv"
   narrow_search_range: 5.0   # degrees — tiny refinement search around IMU yaw
 
 # --- ICP parameters ---
@@ -79,8 +79,8 @@ loop_closure:
 
 # --- Point cloud filter (z-slice before flattening to 2D) ---
 filter:
-  z_min: 0.0    # meters – discard points below this height
-  z_max: 2.0    # meters – discard points above this height
+  z_min: -100.0    # meters – discard points below this height
+  z_max: 100.0    # meters – discard points above this height
 
 # --- Occupancy grid / mapping ---
 mapping:
