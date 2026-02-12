@@ -675,8 +675,8 @@ def main():
     print("global_pose:\n", global_pose)
 
     if mapper is not None:
-        mapper.save_csv(out_cfg.get("csv", "occupancy_grid.csv"))
-        mapper.save_npy(out_cfg.get("npy", "occupancy_grid.npy"))
+        mapper.save_csv(out_cfg.get("csv", "tmp/occupancy_grid.csv"))
+        mapper.save_npy(out_cfg.get("npy", "tmp/occupancy_grid.npy"))
 
 
 if __name__ == "__main__":

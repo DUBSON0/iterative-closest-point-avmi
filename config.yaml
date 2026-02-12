@@ -3,7 +3,7 @@
 # ============================================================
 
 # --- Data source ---
-data_file: "data/data_recording_20251007_163713_lidar_reader__Decoded_VLP_to_PointCloud_1_1_XYZ_points.csv"
+data_file: "data/test3lidar_trimmed.csv"
 
 # --- IMU orientation (quaternion) ---
 # When enabled the gyro-derived absolute yaw replaces the expensive rotation
@@ -11,7 +11,7 @@ data_file: "data/data_recording_20251007_163713_lidar_reader__Decoded_VLP_to_Poi
 # delimited with columns: timestamp_us ; qx ; qy ; qz ; qw
 imu:
   enabled: true
-  file: "data/data_recording_20251007_163713_vn_300_ros2_mc_1__imu_sub_orientation_quaternion.csv"
+  file: "data/test3imu_trimmed.csv"
   narrow_search_range: 5.0   # degrees — tiny refinement search around IMU yaw
 
 # --- ICP parameters ---
@@ -115,5 +115,5 @@ display:
 
 # --- Output files ---
 output:
-  csv: "occupancy_grid.csv"
-  npy: "occupancy_grid.npy"
+  csv: "tmp/occupancy_grid.csv"
+  npy: "tmp/occupancy_grid.npy"

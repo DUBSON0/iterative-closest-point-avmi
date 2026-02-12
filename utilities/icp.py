@@ -263,7 +263,9 @@ def run_dual_file_icp():
     visualize_transformation(r, t, points_a, points_b)
 
 def visualize_transformation(r, t, source, target):
-    import pcview  # lazy import — pcview lives at project root
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'meta-utils'))
+    import pcview  # lazy import — pcview lives in meta-utils/
     transformed_source = np.dot(source, r.T) + t
     pcview.visualize_point_clouds(
         [source, transformed_source, target],
