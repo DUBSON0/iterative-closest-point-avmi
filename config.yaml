@@ -82,7 +82,7 @@ loop_closure:
 filter:
   z_min: -100.0        # meters – hard discard below this height (noise gate)
   z_max: 100.0         # meters – hard discard above this height (noise gate)
-  max_range: 1000.0      # meters – discard points farther than this (xy distance from sensor)
+  max_range: 100.0      # meters – discard points farther than this (xy distance from sensor)
   # Ground / obstacle split (sensor-frame z):
   #   z < obstacle_z_min  ->  ground (elevation only, NOT marked as obstacle)
   #   obstacle_z_min <= z <= obstacle_z_max  ->  obstacle (elevation + occupancy)
