@@ -1,0 +1,426 @@
+% Pseudocode for SLAM-related algorithms in this repository
+% (ICP, feature pre-alignment, occupancy mapping, pose graph, slam.py)
+\documentclass[11pt,a4paper]{article}
+\usepackage{amsmath,amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{caption}
+\captionsetup[algorithm]{labelformat=empty}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+
+\title{Pseudocode: 2D LiDAR SLAM (ICP, Mapping, Pose Graph)}
+\author{(Derived from \texttt{slam.py}, \texttt{utilities/icp.py}, \texttt{utilities/features.py}, \texttt{utilities/mapping.py}, \texttt{utilities/pose\_graph.py})}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{Notation}
+Points are in $\mathbb{R}^2$ unless stated otherwise.
+Homogeneous poses are $3 \times 3$ matrices $T = \begin{bmatrix} R & t \\ 0 & 1 \end{bmatrix}$.
+ICP returns a forward transform mapping \emph{source} toward \emph{target}: $p' = R p + t$.
+
+% ---------------------------------------------------------------------------
+\section{Test environment and supporting utilities}
+
+Experiments are run \emph{offline} on recorded sensor logs rather than on a live network stream. The main entry point (\texttt{slam.py}) reads paths and timing options from \texttt{config.yaml}, then drives registration and mapping over a synthetic scan iterator built from disk. \texttt{services/lidar\_service.py} implements that iterator: it parses semicolon-separated rows with a leading microsecond \texttt{timestamp} and flattened $(x,y,z)$ triples per return, discards all-zero padding triples, and yields \texttt{(timestamp\_raw,\,rel\_time\_us,\,points)} per line with optional sleep or file looping to mimic real-time acquisition; \texttt{rel\_time\_us} is microseconds since the first scan so lidar frames align with IMU time. When IMU-assisted initialisation is used, \texttt{services/imu\_service.py} loads quaternion samples (each row: timestamp and $q_x, q_y, q_z, q_w$ separated by semicolons), derives yaw about the vertical axis, and exposes \texttt{yaw\_at(rel\_time\_us)} and \texttt{delta\_yaw} by nearest-neighbour lookup, so the stack depends only on paired CSV logs and configuration, not on live middleware. Supporting scripts under \texttt{meta-utils/} are not part of the SLAM imports: they use PyVista for inspection---\texttt{pcplayer.py} plays files from \texttt{data/}, distinguishing simple comma-separated clouds from semicolon lidar scans, streaming frames in the background when helpful and applying stride or voxel downsampling for smooth playback; \texttt{pcview.py} visualises one or more static comma-separated clouds with optional legends and layer toggles; \texttt{pcman.py} applies rigid transforms to a cloud, overlays original and transformed points, and can export the result for checks on toy data such as \texttt{teapot.csv}.
+
+% ---------------------------------------------------------------------------
+\section{Point cloud preprocessing}
+
+\subsection*{Downsampling}
+
+A single 2D or 3D LiDAR sweep often yields a very large number of points. Nearest-neighbour queries and repeated least-squares steps in ICP then dominate runtime and memory, and highly redundant samples along walls or ground add little new constraint while amplifying noise in dense regions. \emph{Downsampling} reduces the point count before registration and mapping while preserving the geometric structure needed for alignment.
+
+This pipeline uses \emph{voxel grid downsampling}. Space is partitioned into axis-aligned cubes (squares in 2D) of fixed edge length~$v$. All points falling in the same cell are merged into one representative. Here the representative is the \emph{arithmetic mean} of the cell's points, which smooths jitter and keeps a stable centroid inside extended surfaces. The voxel edge length~$v$ controls the resolution--cost trade-off: smaller~$v$ retains more detail and tighter fits but increases the number of voxels and the cost of each ICP iteration; larger~$v$ speeds up matching and can improve robustness when scans are noisy or only loosely initialised, at the expense of losing thin structures and fine alignment cues. Different stages may use different voxel sizes---for example a coarser grid for coarse rotation search or feature extraction, and a finer grid for scan-to-scan ICP and submap construction---so that expensive steps run on fewer points while the final alignment still uses a density matched to the sensor and the scene scale.
+
+\begin{algorithm}
+\caption{Voxel downsampling (mean per voxel)}
+\begin{algorithmic}[1]
+\Require Point set $P = \{p_i\}_{i=1}^N \subset \mathbb{R}^d$, voxel edge length $v > 0$
+\State $\ell \gets \min_{i} p_i$ \Comment{per-axis minima}
+\For{each point $p_i$}
+    \State $k_i \gets \lfloor (p_i - \ell) / v \rfloor$ \Comment{integer voxel index}
+\EndFor
+\State Cluster points by identical $k_i$; for each cluster $C$, output $\frac{1}{|C|}\sum_{p \in C} p$
+\Ensure Downsampled point set (one representative per occupied voxel)
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Height filter and projection to 2D (\texttt{filter\_and\_flatten})}
+\begin{algorithmic}[1]
+\Require 3D points $(x,y,z)$, bounds $z_{\min}, z_{\max}$
+\State Keep rows with $z_{\min} \le z \le z_{\max}$; discard $z$
+\Ensure 2D points $(x,y)$
+\end{algorithmic}
+\end{algorithm}
+
+% ---------------------------------------------------------------------------
+\section{Normals and ICP}
+
+\begin{algorithm}
+\caption{2D normal estimation via local PCA (\texttt{estimate\_normals\_2d})}
+\begin{algorithmic}[1]
+\Require Points $Q$, neighbour count $k$
+\State Build KD-tree on $Q$
+\For{each point $q_i \in Q$}
+    \State $\mathcal{N}_i \gets$ $k{+}1$ nearest neighbours of $q_i$ (including self)
+    \State $C \gets \mathrm{Cov}(\mathcal{N}_i)$ \Comment{$2\times 2$ covariance}
+    \State $(\lambda_{\min}, v_{\min}) \gets$ smallest eigenpair of $C$
+    \State $n_i \gets v_{\min} / \|v_{\min}\|$ \Comment{unit normal}
+\EndFor
+\Ensure Normals $\{n_i\}$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{One point-to-line ICP step, 2D linearised (\texttt{\_point\_to\_line\_solve\_2d})}
+\begin{algorithmic}[1]
+\Require Transformed source points $\{p_i\}$, target points $Q$, target normals $\{n_j\}$, match indices $j_i$
+\For{each correspondence $i$}
+    \State $q_i \gets Q_{j_i}$, \quad $n_i \gets n_{j_i}$
+    \State Form row of $A$: $[c_i,\, n_{i,x},\, n_{i,y}]$ where $c_i = n_{i,y} p_{i,x} - n_{i,x} p_{i,y}$
+    \State $b_i \gets -\, n_i \cdot (p_i - q_i)$
+\EndFor
+\State Solve least squares: $(A^\top A) x = A^\top b$, \quad $x = [\theta, t_x, t_y]^\top$
+\State $R \gets R(\theta)$ (true $2\times 2$ rotation), $t \gets [t_x, t_y]^\top$
+\Ensure Incremental rotation $R$, translation $t$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Rigid transform from paired points --- SVD / Procrustes}
+\begin{algorithmic}[1]
+\Require Matched sets $\{p_i\}$, $\{q_i\}$ (same count), at least 2 pairs
+\State $\bar{p} \gets \mathrm{mean}(p)$, \quad $\bar{q} \gets \mathrm{mean}(q)$
+\State $W \gets \sum_i (p_i - \bar{p})(q_i - \bar{q})^\top$ \Comment{or matrix form $(P-\bar{p})^\top(Q-\bar{q})$}
+\State $U, \Sigma, V^\top \gets \mathrm{SVD}(W)$
+\State $R \gets V U^\top$; if $\det(R)<0$, flip sign of last row of $V^\top$ and recompute $R$
+\State $t \gets \bar{q} - R \bar{p}$
+\Ensure Rotation $R$, translation $t$ mapping $p \mapsto Rp+t \approx q$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Iterative Closest Point (\texttt{ICP})}
+\begin{algorithmic}[1]
+\Require Source $S$, target $T$, voxel size $v$, max iterations $I$, error threshold $\epsilon$
+\State \textbf{Optional:} initial guess $(R_0,t_0)$; method (point-to-point or point-to-line); max correspondence distance $d_{\max}$
+\State $S \gets \mathrm{VoxelDownsample}(S,v)$, \quad $T \gets \mathrm{VoxelDownsample}(T,v)$
+\State Initialise transformed cloud $P$ from $S$ and $(R_0,t_0)$ if given; $R_{\mathrm{tot}} \gets I$, $t_{\mathrm{tot}} \gets 0$
+\If{point-to-line in 2D}
+    \State Precompute normals on $T$
+\EndIf
+\State Build KD-tree on $T$
+\For{$k = 1$ to $I$}
+    \For{each point $p \in P$}
+        \State Find nearest $q \in T$ and distance $d$
+    \EndFor
+    \If{$d_{\max}$ is set}
+        \State Keep correspondences with $d^2 < d_{\max}^2$; abort if too few inliers
+    \EndIf
+    \If{point-to-line (2D)}
+        \State $(R, t) \gets \text{PointToLineStep}(P, T, \text{normals}, \text{indices})$
+    \Else
+        \State $(R, t) \gets \text{SVDProcrustes}(\text{centered inlier pairs})$
+    \EndIf
+    \State $R_{\mathrm{tot}} \gets R R_{\mathrm{tot}}$, \quad $t_{\mathrm{tot}} \gets R t_{\mathrm{tot}} + t$, \quad $P \gets R P + t$ (row-wise)
+    \State $e_k \gets$ mean squared point-to-point distance to current nearest neighbours
+    \If{$|e_k - e_{k-1}| < \epsilon$}
+        \State \textbf{break}
+    \EndIf
+\EndFor
+\Ensure $R_{\mathrm{tot}}, t_{\mathrm{tot}}$, final error
+\end{algorithmic}
+\end{algorithm}
+
+% ---------------------------------------------------------------------------
+\section{Feature-based pre-alignment}
+
+\begin{algorithm}
+\caption{Curvature proxy from local PCA (\texttt{compute\_curvature})}
+\begin{algorithmic}[1]
+\Require Points $P$, neighbour count $k$
+\For{each point $p_i$}
+    \State $\mathcal{N}_i \gets$ $k{+}1$ nearest neighbours
+    \State $\lambda_1 \le \lambda_2 \gets$ eigenvalues of $\mathrm{Cov}(\mathcal{N}_i)$
+    \State $\kappa_i \gets \lambda_1 / (\lambda_2 + \varepsilon)$
+\EndFor
+\Ensure $\kappa_i \in [0,1]$ (large $\approx$ corner-like)
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Keypoint extraction with spatial non-max suppression (\texttt{extract\_keypoints})}
+\begin{algorithmic}[1]
+\Require Points $P$, curvatures $\kappa$, count $N_{\mathrm{kp}}$, minimum separation $\delta$
+\State Sort point indices by decreasing $\kappa$
+\State $K \gets \emptyset$
+\For{each index $i$ in sorted order}
+    \If{$|K| \ge N_{\mathrm{kp}}$} \textbf{break} \EndIf
+    \If{every keypoint in $K$ is at least $\delta$ away from $P_i$}
+        \State Add $i$ to $K$
+    \EndIf
+\EndFor
+\Ensure Keypoint indices $K$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Sorted-distance descriptor (\texttt{compute\_descriptors})}
+\begin{algorithmic}[1]
+\Require Full cloud $P$, keypoint indices $K$, descriptor size $k$
+\For{each keypoint $p \in P_K$}
+    \State $d_1,\ldots,d_{k+1} \gets$ distances to $k{+}1$ nearest points in $P$ (including self)
+    \State Descriptor $\gets \mathrm{sort}([d_2,\ldots,d_{k+1}])$ \Comment{drop self-distance}
+\EndFor
+\Ensure Descriptor matrix
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Descriptor matching with Lowe's ratio test (\texttt{match\_descriptors})}
+\begin{algorithmic}[1]
+\Require Descriptors $D^A, D^B$, ratio $\rho \in (0,1)$
+\For{each row $D^A_i$}
+    \State Find two nearest rows in $D^B$ by squared Euclidean distance: $j_1, j_2$
+    \If{$\|D^A_i - D^B_{j_1}\|^2 < \rho^2 \|D^A_i - D^B_{j_2}\|^2$}
+        \State Add match $(i, j_1)$
+    \EndIf
+\EndFor
+\Ensure List of pairs $(i,j)$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{RANSAC for 2D rigid alignment (\texttt{ransac\_align})}
+\begin{algorithmic}[1]
+\Require Keypoints $S, T$, matches $\mathcal{M}$, iterations $N$, inlier threshold $\tau$
+\For{$n = 1$ to $N$}
+    \State Randomly pick 2 distinct matches; estimate $(R,t)$ by SVD Procrustes on the two pairs
+    \State Count inliers: matches whose reprojection error $\|R s + t - t_{\mathrm{match}}\| < \tau$
+    \State Track best $(R,t)$ with largest inlier count
+\EndFor
+\State Refit $(R,t)$ with SVD Procrustes on \emph{all} inliers of the best model
+\Ensure $R, t$, inlier count
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Correlative rotation search (\texttt{rotation\_search})}
+\begin{algorithmic}[1]
+\Require Scans $S, T$, voxel size, coarse step $\Delta_\theta^{\mathrm{c}}$, fine step $\Delta_\theta^{\mathrm{f}}$
+\State Downsample $S,T$; centre $S$ at origin, note centroids $\bar{s},\bar{t}$
+\State Build KD-tree on $T$
+\Function{Score}{$\theta$}
+    \State $P \gets R(\theta) S + \bar{t}$ \Comment{rotate centred source, place at target centroid}
+    \State \Return mean squared distance from each point in $P$ to its NN in $T$
+\EndFunction
+\State Coarse grid: $\theta \in [-180^\circ,180^\circ)$ step $\Delta_\theta^{\mathrm{c}}$; pick $\theta^\ast$ minimising Score
+\State Fine grid: $\theta$ in $[\theta^\ast - \Delta_\theta^{\mathrm{c}}, \theta^\ast + \Delta_\theta^{\mathrm{c}}]$ step $\Delta_\theta^{\mathrm{f}}$
+\State $R \gets R(\theta^\ast)$, \quad $t \gets \bar{t} - R \bar{s}$
+\Ensure Initial $R, t$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Feature-based alignment pipeline (\texttt{feature\_based\_alignment})}
+\begin{algorithmic}[1]
+\Require Source $S$, target $T$, hyperparameters (voxel, $k$, $N_{\mathrm{kp}}$, RANSAC, \ldots)
+\State Downsample $S,T$
+\State Keypoints from curvature + suppression on each cloud
+\State Descriptors; matches via ratio test; RANSAC $\to$ $(R,t)$ or failure
+\Ensure $R, t$, inlier count
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Scan pair: optional pre-alignment + ICP (\texttt{\_run\_icp\_pair})}
+\begin{algorithmic}[1]
+\If{config uses rotation search and/or features}
+    \State Optionally run \texttt{rotation\_search}; optionally run \texttt{feature\_based\_alignment} on (pre-rotated) source
+    \State Compose initial $R_{\mathrm{init}}, t_{\mathrm{init}}$
+\EndIf
+\State Run \texttt{ICP}$(S, T, \ldots, R_{\mathrm{init}}, t_{\mathrm{init}})$
+\end{algorithmic}
+\end{algorithm}
+
+% ---------------------------------------------------------------------------
+\section{Occupancy mapping}
+
+\begin{algorithm}
+\caption{Bresenham line on the integer grid (\texttt{\_bresenham})}
+\begin{algorithmic}[1]
+\Require Integer start $(x_0,y_0)$, end $(x_1,y_1)$
+\State Initialise Bresenham error and step directions $(s_x,s_y)$
+\While{true}
+    \If{current cell equals $(x_1,y_1)$} \textbf{break} \EndIf
+    \State Append current cell to list; advance cell per Bresenham midpoint rule
+\EndWhile
+\Ensure Cells on the segment from start toward end, \emph{excluding} the endpoint
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Log-odds occupancy update for one scan (\texttt{OccupancyGrid2D.update\_scan})}
+\begin{algorithmic}[1]
+\Require Sensor origin $o$, hit points $\{h_i\}$ in world frame; priors $p_{\mathrm{hit}}, p_{\mathrm{miss}}$; clamp $[\ell_{\min},\ell_{\max}]$
+\State $\ell_{\mathrm{hit}} \gets \log\frac{p_{\mathrm{hit}}}{1-p_{\mathrm{hit}}}$, \quad $\ell_{\mathrm{miss}} \gets \log\frac{p_{\mathrm{miss}}}{1-p_{\mathrm{miss}}}$
+\State Convert $o$ and each $h_i$ to grid indices
+\For{each in-bounds hit cell}
+    \State $\mathrm{log\_odds}(\text{cell}) \mathrel{+}= \ell_{\mathrm{hit}}$
+\EndFor
+\For{each ray from grid origin to hit}
+    \For{each cell $c$ on Bresenham path \emph{excluding} endpoint}
+        \State $\mathrm{log\_odds}(c) \mathrel{+}= \ell_{\mathrm{miss}}$
+    \EndFor
+\EndFor
+\State Clamp all $\mathrm{log\_odds}$ to $[\ell_{\min}, \ell_{\max}]$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Replay map from pose history (\texttt{\_rebuild\_map})}
+\begin{algorithmic}[1]
+\Require Mapper $M$, list $(P^{(k)}, T^{(k)})$ of body points and global poses
+\State Clear $M$
+\For{each $(P, T)$}
+    \State Origin $\gets$ translation part of $T$; hits $\gets T$ applied to $P$
+    \State $M.\texttt{update\_scan}(\text{origin}, \text{hits})$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+% ---------------------------------------------------------------------------
+\section{Pose graph}
+
+\begin{algorithm}
+\caption{Relative pose measurement between nodes (\texttt{relative\_transform\_vec})}
+\begin{algorithmic}[1]
+\Require Homogeneous poses $T_i, T_j$
+\State \Return $\mathrm{vec}(T_i^{-1} T_j)$ as $[\Delta x, \Delta y, \Delta\theta]^\top$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Gauss--Newton pose-graph optimisation (\texttt{PoseGraph2D.optimize})}
+\begin{algorithmic}[1]
+\Require Nodes $x_k = [x,y,\theta]_k$, edges $(i,j)$ with measurement $z_{ij}$ and information $\Omega_{ij}$; fixed node index $f$
+\For{iteration until max or convergence}
+    \State $H \gets 0$, $b \gets 0$ (size $3n \times 3n$)
+    \For{each edge $(i,j)$}
+        \State $e, A, B \gets$ error $e(x_i,x_j,z_{ij})$ and Jacobians $\partial e/\partial x_i$, $\partial e/\partial x_j$
+        \State Accumulate $A^\top \Omega A$, $A^\top \Omega B$, $B^\top \Omega A$, $B^\top \Omega B$ into $H$; $A^\top \Omega e$, $B^\top \Omega e$ into $b$
+    \EndFor
+    \State Anchor: replace block for node $f$ in $H$ with large diagonal, zero corresponding $b$
+    \State Solve $H\,\delta = -b$; update each $x_k \mathrel{+}= \delta_k$ (wrap $\theta$ to $(-\pi,\pi]$)
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\noindent Edge error (conceptually): predicted relative pose from $T(x_i)^{-1} T(x_j)$ compared to $z_{ij}$ in SE(2).
+
+% ---------------------------------------------------------------------------
+\section{SLAM orchestration (\texttt{run\_slam})}
+
+\begin{algorithm}
+\caption{Accumulate ICP increment into global pose (\texttt{apply\_incremental\_pose\_2d})}
+\begin{algorithmic}[1]
+\Require Current global pose $T_{\mathrm{glob}}$, ICP output mapping previous scan $\to$ current: $p_{\mathrm{cur}} \approx R p_{\mathrm{prev}} + t$
+\State $T_{\mathrm{inc}}^{-1} \gets \begin{bmatrix} R^\top & -R^\top t \\ 0 & 1 \end{bmatrix}$ \Comment{inverse of forward body motion in 2D}
+\State $T_{\mathrm{glob}} \gets T_{\mathrm{glob}}\, T_{\mathrm{inc}}^{-1}$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Submap construction (\texttt{\_build\_submap})}
+\begin{algorithmic}[1]
+\Require Buffer of recent scans in global frame, voxel size $v$
+\State Concatenate all points; \Return $\mathrm{VoxelDownsample}(\cdot, v)$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Submap alignment: local rotation search + translation tweak (\texttt{\_submap\_rotation\_search})}
+\begin{algorithmic}[1]
+\Require Current scan (local), submap (global), predicted pose $T_{\mathrm{pred}}$, angle range/step, voxel size
+\State Downsample; KD-tree on submap
+\State Score rotations $\theta$ around predicted yaw with translation fixed to $t_{\mathrm{pred}}$ (mean squared NN distance)
+\State Coarse then fine angular sweep; best $R$
+\State One-step refinement: transform scan by $R$, match to submap by NN, keep bottom 80\% distances by threshold, set $t$ to mean of $(q - R s)$ on inliers
+\Ensure $R, t$ for scan in world frame
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Submap ICP (\texttt{\_attempt\_submap\_icp})}
+\begin{algorithmic}[1]
+\If{IMU yaw available}
+    \State Override predicted rotation with IMU; narrow angular search
+\Else
+    \State Wide angular search
+\EndIf
+\State $(R_0, t_0) \gets$ submap rotation search result
+\State Run point-to-point \texttt{ICP} with $R_0,t_0$ and max correspondence distance
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Loop-closure candidate selection (\texttt{\_find\_loop\_candidates})}
+\begin{algorithmic}[1]
+\Require Current pose index $c$, history of poses, distance threshold $d$, min scan gap $g$, max candidates, min cumulative travel $L$
+\State Precompute cumulative path length along pose positions
+\For{each past index $i$ with $c - i \ge g$}
+    \If{$\|p_c - p_i\| < d$ and path length from $i$ to $c$ is $\ge L$}
+        \State Add $i$ as candidate
+    \EndIf
+\EndFor
+\State Sort candidates by distance; return first few
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{Main online SLAM loop (high level)}
+\begin{algorithmic}[1]
+\State Read lidar stream; optionally load IMU (yaw at time, delta yaw between scans)
+\For{each scan}
+    \State Optionally skip by \texttt{process\_every\_n}
+    \State 2D filter by height
+    \If{first scan}
+        \State Initialise map bounds, occupancy grid, pose graph root, submap buffer
+    \Else
+        \State Scan-to-scan: ICP with optional IMU rotation init or \texttt{\_run\_icp\_pair}
+        \If{error too large} skip pose update \EndIf
+        \State $T_{\mathrm{glob}} \gets$ apply incremental transform
+        \If{submaps enabled}
+            \State Optionally correct $T_{\mathrm{glob}}$ if submap ICP agrees within thresholds
+        \EndIf
+        \State Add pose-graph node; odometry edge from previous with information $\propto 1/\text{error}$
+        \State Insert scan into occupancy grid at $T_{\mathrm{glob}}$
+        \If{loop closure enabled}
+            \State Find candidates; try ICP current vs old scan; if good, add loop edge $z_{lc}$, optimise graph, rewrite history, rebuild submap buffer, \texttt{\_rebuild\_map}
+        \EndIf
+    \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{IMU yaw from quaternion (\texttt{\_quat\_to\_yaw})}
+\begin{algorithmic}[1]
+\Require Unit quaternion $(q_x,q_y,q_z,q_w)$
+\State $\mathrm{yaw} \gets \mathrm{atan2}\bigl(2(q_w q_z + q_x q_y),\; 1 - 2(q_y^2 + q_z^2)\bigr)$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}
+\caption{IMU yaw lookup (\texttt{IMUService.yaw\_at})}
+\begin{algorithmic}[1]
+\Require Sorted relative timestamps, yaw array, query time $t$
+\State Binary search; compare neighbours; return yaw of nearest timestamp
+\end{algorithmic}
+\end{algorithm}
+
+\end{document}
