@@ -12,17 +12,17 @@ data_file: "data/1007lidar.csv"
 imu:
   enabled: true
   file: "data/1007imu.csv"
-  narrow_search_range: 5.0   # degrees — tiny refinement search around IMU yaw
+  narrow_search_range: 3.0   # degrees — tiny refinement search around IMU yaw
 
 # --- ICP parameters ---
 # method: "point_to_line" (recommended for 2D) or "point_to_point" (classic)
 icp:
   method: "point_to_line"
-  normal_k: 10                  # neighbours for normal estimation (point_to_line only)
-  voxel_size: 0.06
+  normal_k: 12                    # neighbours for normal estimation (point_to_line only)
+  voxel_size: 0.04               # finer voxel → more points → better alignment
   error_threshold: 1.0e-10
-  max_iterations: 100
-  error_reject_threshold: 0.25  # skip scan if ICP error > this value
+  max_iterations: 150            # more headroom for tight convergence
+  error_reject_threshold: 0.15   # tighter rejection of bad scans
 
 # --- Pre-alignment (handles large inter-scan rotations) ---
 # method: "rotation_search" | "features" | "both" | "none"
@@ -34,9 +34,9 @@ features:
   method: "rotation_search"
 
   # ─ correlative rotation search ─
-  rotation_voxel_size: 0.2   # coarse voxel for the angle sweep (meters)
-  angle_step_coarse: 2.0      # degrees per step in the full [-180°,180°) sweep
-  angle_step_fine: 0.2        # degrees per step in the refinement band
+  rotation_voxel_size: 0.15  # slightly finer voxel for more accurate angle scoring
+  angle_step_coarse: 1.5     # degrees per step (finer → less chance of missing the peak)
+  angle_step_fine: 0.1       # degrees per step in the refinement band
 
   # ─ feature-based alignment (used when method is "features" or "both") ─
   voxel_size: 0.2       # coarse downsample for feature extraction (meters)
@@ -44,7 +44,7 @@ features:
   top_n: 100            # max keypoints per scan
   min_kp_dist: 0.3      # non-max suppression radius (meters)
   k_descriptor: 30      # neighbours for sorted-distance descriptor
-  ratio_threshold: 0.8  # Lowe's ratio test for descriptor matching
+  ratio_threshold: 0.7  # Lowe's ratio test for descriptor matching
   ransac_iterations: 1000
   inlier_threshold: 0.5 # RANSAC inlier distance (meters)
   min_inliers: 3        # minimum inliers to accept alignment (else fall back to identity)
@@ -56,45 +56,43 @@ features:
 # multi-scan data have inconsistent sign that corrupts the point-to-line solver.
 submap:
   enabled: true           # false = fall back to scan-to-scan ICP
-  size: 30                # recent scans in the submap (more = more robust during turns)
-  voxel_size: 0.06        # downsample density for the submap (≥ icp.voxel_size)
-  max_corr_dist: 2.0      # metres — reject correspondences farther than this (needs slack for submap drift)
-  rotation_range: 90.0    # degrees — search ± this range around predicted rotation (catches aggressive turns)
-  rotation_step: 1.0      # degrees — coarse step for rotation search (finer = more accurate)
-  rotation_fine_step: 0.2  # degrees — fine sweep step (sub-degree precision)
-  rotation_voxel_size: 0.25  # coarse voxel for rotation search scoring (speed)
+  size: 40                # larger window → more context for robust matching
+  voxel_size: 0.04        # match ICP voxel for consistency
+  max_corr_dist: 1.5      # metres — tighter filter removes stale submap points
+  rotation_range: 60.0    # degrees — narrower since IMU handles large turns
+  rotation_step: 0.8      # degrees — finer coarse sweep
+  rotation_fine_step: 0.1 # degrees — tighter fine sweep
+  rotation_voxel_size: 0.2  # slightly finer scoring grid
 
 # --- Loop closure & pose graph optimisation ---
 loop_closure:
   enabled: true
-  distance_threshold: 0.5       # metres — consider closure if estimated poses are this close
-  min_interval: 100             # minimum scan gap (high enough to skip same-path segment)
-  min_cumulative_travel: 13.0  # metres — vehicle must have driven at least this far along the
-                                # trajectory since the candidate scan (prevents false closures
-                                # when the robot is still near the start and hasn't left yet)
-  max_candidates: 3             # try up to N candidates per scan
-  error_threshold: 0.1          # max ICP error to accept a loop closure (lower = stricter)
-  optimization_iterations: 20   # Gauss-Newton iterations
-  information_scale: 1.0        # weight multiplier for loop-closure edges vs odometry
+  distance_threshold: 3.0       # metres — generous: accumulated drift can be 1–3 m
+  min_interval: 80              # scans — lowered to catch shorter loops
+  min_cumulative_travel: 6.0    # metres — lowered so shorter out-and-back trips trigger closure
+  max_candidates: 5             # try more candidates to find the best match
+  error_threshold: 0.08         # slightly tighter — only accept high-confidence closures
+  optimization_iterations: 30   # more iterations for better convergence
+  information_scale: 5.0        # stronger loop-closure edges pull harder during optimisation
 
 # --- Point cloud filter (z-slice before flattening to 2D) ---
 filter:
-  z_min: 0.5    # meters – discard points below this height
-  z_max: 1.3    # meters – discard points above this height
+  z_min: 1.0    # meters – discard points below this height
+  z_max: 1.4    # meters – discard points above this height
 
 # --- Occupancy grid / mapping ---
 mapping:
-  resolution: 0.15     # meters per cell
-  margin: 50.0        # meters of padding around first scan bounds
-  p_hit: 0.9          # probability update for occupied cells (higher = harder to erase)
-  p_miss: 0.45        # probability update for free (ray) cells (closer to 0.5 = weaker free updates)
-  log_odds_min: -10.0  # clamp lower bound (larger range = more permanence)
-  log_odds_max: 10.0   # clamp upper bound
+  resolution: 0.05     # meters per cell — crisp walls and features
+  margin: 50.0         # meters of padding around first scan bounds
+  p_hit: 0.85          # slightly softer hit → less noise burned in from a single bad scan
+  p_miss: 0.42         # stronger free-space clearing → cleaner corridors
+  log_odds_min: -8.0   # moderate clamp so cells can still flip if revisited
+  log_odds_max: 8.0    # moderate clamp — avoids over-saturation
 
 # --- Lidar service ---
 service:
   sleep_s: 0.0        # delay between scans (seconds), 0 = as fast as possible
-  loop: true           # restart file when end is reached
+  loop: false          # stop at end of file (one clean pass)
 
 # --- Run control ---
 num_scans: null        # null = unlimited, or set an integer to limit
@@ -108,8 +106,8 @@ display:
   cmap: "gray"
   clim_min: 0.0
   clim_max: 1.0
-  background: "black"
-  trajectory_color: "cyan"
+  background: "white"
+  trajectory_color: "red"
   pose_color: "lime"
   pose_size: 12
 

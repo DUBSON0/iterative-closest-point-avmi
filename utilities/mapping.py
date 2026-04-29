@@ -3,8 +3,8 @@ import pyvista as pv
 
 
 # Cell states for visualization:
-#   unexplored  → 0.5  (gray)
-#   free        → 1.0  (white)
+#   unexplored  → 1.0  (white)
+#   free        → 0.85 (light grey)
 #   occupied    → 0.0  (black)
 
 UNEXPLORED = 0.0   # log-odds = 0 → probability 0.5
@@ -153,8 +153,11 @@ class OccupancyGrid2D:
         return 1.0 / (1.0 + np.exp(-self.log_odds))
 
     def to_display(self):
-        """Map to display values: free=1 (white), unexplored=0.5 (gray), occupied=0 (black)."""
-        return 1.0 - self.to_probability()
+        """Map to display values: unexplored=1 (white), free=0.85 (light grey), occupied=0 (black)."""
+        display = 1.0 - self.to_probability()
+        display[self.log_odds == 0.0] = 1.0   # unexplored → white
+        display[self.log_odds < 0.0]  = 0.85  # free → light grey
+        return display
 
     # ------------------------------------------------------------------
     # PyVista helpers

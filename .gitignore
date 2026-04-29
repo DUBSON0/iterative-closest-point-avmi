@@ -24,3 +24,5 @@ venv/
 TestResults.xmlseperate_point_cloud_viewer/pointcloud-1-line.csv
 seperate_point_cloud_viewer/pointcloud1.9.csv
 seperate_point_cloud_viewer/pointcloud4line.csv
+tmp/occupancy_grid.csv
+tmp/occupancy_grid.npy

@@ -178,10 +178,27 @@ def downsample(points: np.ndarray, stride: int = 1,
 
 
 # ── Playback ────────────────────────────────────────────────────────────────
+def _add_cloud_mesh(plotter, cloud: pv.PolyData, pts: np.ndarray,
+                    point_size: float, color: str | None, cmap: str | None,
+                    clim: tuple[float, float] | None, name: str):
+    """Add a point cloud mesh with either flat colour or z-height colormap."""
+    kwargs: dict = dict(point_size=point_size, render_points_as_spheres=False, name=name)
+    if cmap:
+        kwargs["scalars"] = pts[:, 2]
+        kwargs["cmap"] = cmap
+        kwargs["show_scalar_bar"] = False
+        if clim is not None:
+            kwargs["clim"] = list(clim)
+    else:
+        kwargs["color"] = color or "black"
+    plotter.add_mesh(cloud, **kwargs)
+
+
 def play_lidar_stream(stream: LidarFrameStream,
                       stride: int, voxel_size: float,
                       point_size: float, fps: float,
-                      color: str, bg: str, window_size: tuple[int, int]):
+                      color: str | None, cmap: str | None,
+                      bg: str, window_size: tuple[int, int]):
     """Animate lidar frames, consuming them from a background stream."""
 
     # Wait for at least the first frame
@@ -198,18 +215,25 @@ def play_lidar_stream(stream: LidarFrameStream,
     first_pts = downsample(first_frame[1], stride, voxel_size)
     cloud = pv.PolyData(first_pts)
 
+    # Seed z-range from the first frame so colour scale stays stable
+    clim: tuple[float, float] | None = None
+    if cmap and len(first_pts):
+        clim = (float(first_pts[:, 2].min()), float(first_pts[:, 2].max()))
+
+    text_color = "black" if bg in ("white", "#ffffff", "#FFFFFF") else "white"
+
     plotter = pv.Plotter(window_size=window_size)
     plotter.background_color = bg
-    plotter.add_mesh(cloud, color=color, point_size=point_size,
-                     render_points_as_spheres=False, name="cloud")
+    _add_cloud_mesh(plotter, cloud, first_pts, point_size, color, cmap, clim, "cloud")
     plotter.add_axes(line_width=2, labels_off=False)
 
     total_str = str(stream.total) if stream.total else "?"
     plotter.add_text(
         f"Scan 1/{total_str}  |  {len(first_pts)} pts",
-        position="upper_left", font_size=12, color="white", name="title",
+        position="upper_left", font_size=12, color=text_color, name="title",
     )
 
+    plotter.reset_camera()
     plotter.show(interactive_update=True, auto_close=False)
 
     idx = 0
@@ -227,8 +251,7 @@ def play_lidar_stream(stream: LidarFrameStream,
 
         plotter.remove_actor("cloud")
         cloud = pv.PolyData(ds)
-        plotter.add_mesh(cloud, color=color, point_size=point_size,
-                         render_points_as_spheres=False, name="cloud")
+        _add_cloud_mesh(plotter, cloud, ds, point_size, color, cmap, clim, "cloud")
 
         total_str = str(stream.total) if stream.total else "?"
         loaded = stream.count()
@@ -236,7 +259,7 @@ def play_lidar_stream(stream: LidarFrameStream,
         plotter.remove_actor("title")
         plotter.add_text(
             f"Scan {idx + 1}/{total_str}  |  {len(ds)} pts  |  ts {ts}{loading_tag}",
-            position="upper_left", font_size=12, color="white", name="title",
+            position="upper_left", font_size=12, color=text_color, name="title",
         )
         plotter.update()
         if delay > 0:
@@ -250,19 +273,27 @@ def play_lidar_stream(stream: LidarFrameStream,
 def show_static(points: np.ndarray,
                 stride: int, voxel_size: float,
                 point_size: float,
-                color: str, bg: str, window_size: tuple[int, int]):
+                color: str | None, cmap: str | None,
+                bg: str, window_size: tuple[int, int]):
     """Display a static point cloud."""
     ds = downsample(points, stride, voxel_size)
     cloud = pv.PolyData(ds)
+
+    clim: tuple[float, float] | None = None
+    if cmap and len(ds):
+        clim = (float(ds[:, 2].min()), float(ds[:, 2].max()))
+
+    text_color = "black" if bg in ("white", "#ffffff", "#FFFFFF") else "white"
+
     plotter = pv.Plotter(window_size=window_size)
     plotter.background_color = bg
-    plotter.add_mesh(cloud, color=color, point_size=point_size,
-                     render_points_as_spheres=False)
+    _add_cloud_mesh(plotter, cloud, ds, point_size, color, cmap, clim, "cloud")
     plotter.add_axes(line_width=2, labels_off=False)
     plotter.add_text(
         f"{len(ds)} points (downsampled from {len(points)})",
-        position="upper_left", font_size=12, color="white",
+        position="upper_left", font_size=12, color=text_color,
     )
+    plotter.reset_camera()
     plotter.show()
 
 
@@ -284,10 +315,13 @@ def parse_args():
                         help="Rendered point size (default: 2.0)")
     parser.add_argument("--fps", type=float, default=30.0,
                         help="Target playback FPS for lidar files (default: 30)")
-    parser.add_argument("--color", type=str, default="cyan",
-                        help="Point colour (default: cyan)")
-    parser.add_argument("--bg", type=str, default="black",
-                        help="Background colour (default: black)")
+    parser.add_argument("--color", type=str, default=None,
+                        help="Flat point colour (overrides --cmap)")
+    parser.add_argument("--cmap", type=str, default="RdBu_r",
+                        help="Colormap for z-height gradient (default: RdBu_r). "
+                             "Use --color to disable.")
+    parser.add_argument("--bg", type=str, default="white",
+                        help="Background colour (default: white)")
     parser.add_argument("--window-size", type=int, nargs=2, default=[1280, 720],
                         metavar=("W", "H"),
                         help="Window size in pixels (default: 1280 720)")
@@ -318,6 +352,9 @@ def main():
 
     ws = tuple(args.window_size)
 
+    # --color overrides --cmap (flat colour wins)
+    cmap = None if args.color else args.cmap
+
     # ── Load & play ─────────────────────────────────────────────────────
     if fmt == "lidar":
         print("Streaming lidar frames (background loading) …")
@@ -325,14 +362,14 @@ def main():
         stream.start()
         play_lidar_stream(stream, args.stride, args.voxel,
                           args.point_size, args.fps,
-                          args.color, args.bg, ws)
+                          args.color, cmap, args.bg, ws)
     else:
         print("Loading static point cloud …")
         points = load_simple_cloud(chosen)
         print(f"Loaded {len(points)} points")
         show_static(points, args.stride, args.voxel,
                     args.point_size,
-                    args.color, args.bg, ws)
+                    args.color, cmap, args.bg, ws)
 
 
 if __name__ == "__main__":

@@ -25,11 +25,13 @@ def visualize_point_cloud(
     color='cyan',
     background_color='black',
     window_size=(800, 600),
+    azimuth=0.0,
 ):
     point_cloud = pv.PolyData(points)
     plotter = pv.Plotter(window_size=window_size)
     plotter.background_color = background_color
     plotter.add_mesh(point_cloud, color=color, point_size=point_size)
+    plotter.camera.azimuth += azimuth
     plotter.show()
 
 
@@ -42,6 +44,8 @@ def visualize_point_clouds(
     window_size=(800, 600),
     show_legend=True,
     enable_toggles=False,
+    azimuth=0.0,
+    render_points_as_spheres=False,
 ):
     if labels is None:
         labels = [f"Cloud {i + 1}" for i in range(len(point_sets))]
@@ -55,11 +59,16 @@ def visualize_point_clouds(
     actors = []
     for points, label, color in zip(point_sets, labels, colors):
         cloud = pv.PolyData(points)
-        actor = plotter.add_mesh(cloud, color=color, point_size=point_size, label=label)
+        actor = plotter.add_mesh(
+            cloud, color=color, point_size=point_size, label=label,
+            render_points_as_spheres=render_points_as_spheres,
+        )
         actors.append(actor)
 
     if show_legend:
         plotter.add_legend()
+
+    plotter.camera.azimuth += azimuth
 
     if enable_toggles:
         def toggle_actor(actor):
@@ -90,6 +99,7 @@ def visualize_trajectory(
     line_width=2.0,
     background_color='black',
     window_size=(800, 600),
+    azimuth=0.0,
 ):
     if not poses:
         raise ValueError("poses is empty")
@@ -108,6 +118,7 @@ def visualize_trajectory(
         polyline = pv.lines_from_points(positions)
         plotter.add_mesh(polyline, color=line_color, line_width=line_width)
 
+    plotter.camera.azimuth += azimuth
     plotter.show()
 
 
@@ -164,7 +175,14 @@ Examples:
         metavar=('WIDTH', 'HEIGHT'),
         help='Window size in pixels (default: 800 600)'
     )
-    
+
+    parser.add_argument(
+        '--azimuth',
+        type=float,
+        default=-45.0,
+        help='Camera azimuth rotation in degrees (default: -45)'
+    )
+
     args = parser.parse_args()
     
     # Load point cloud
@@ -185,6 +203,7 @@ Examples:
         color=args.color,
         background_color=args.background,
         window_size=tuple(args.window_size),
+        azimuth=args.azimuth,
     )
 
 
